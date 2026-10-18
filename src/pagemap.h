@@ -196,10 +196,11 @@ static ULONG64 kdrv_locate_pte_base(kdrv_t *d)
             }
             kdrv_pte_refs_in_chunk(buf, sec_base + off, take, img_base, img_size,
                                    refs, &ref_count);
-            if (take == left)
+
+            left -= take;
+            if (!left)
                 break;   /* last chunk of this section: nothing left to overlap */
             off += take - (KDRV_MMPTE_PATTERN_LEN - 1);   /* keep a pattern that straddles */
-            left -= take;
         }
     }
     HeapFree(GetProcessHeap(), 0, buf);
