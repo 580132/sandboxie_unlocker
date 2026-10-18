@@ -1,10 +1,10 @@
 /*
  * hostguard.h - host process gate for the unlock thread.
  *
- * The unlock must run only in SandMan.exe; any other process from the
- * Sandboxie directory that picks up version.dll stays a transparent
- * proxy.  The path predicate is separate so tests can cover matching
- * without launching renamed processes.
+ * The unlock must run only in SandMan.exe; any other host process that
+ * picks up version.dll (SbieSvc, Start.exe, a sandboxed app) stays a
+ * transparent proxy.  The path predicate is separate so tests can cover
+ * matching without launching renamed processes.
  */
 #ifndef HOSTGUARD_H
 #define HOSTGUARD_H

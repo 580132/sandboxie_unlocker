@@ -1,7 +1,7 @@
 # Sandboxie-Plus Unlocker
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Windows-11_24H2_x64-0078d6?logo=windows&logoColor=white" alt="Windows 11 24H2 x64" />
+  <img src="https://img.shields.io/badge/Windows-10_%7C_11_x64-0078d6?logo=windows&logoColor=white" alt="Windows 10 / 11 x64" />
   <img src="https://img.shields.io/badge/C-MSVC_2022-555555?logo=c&logoColor=white" alt="C" />
   <img src="https://img.shields.io/github/v/release/CriDos/sandboxie_unlocker?label=Release" alt="Release" />
   <img src="https://img.shields.io/github/actions/workflow/status/CriDos/sandboxie_unlocker/ci.yml?label=CI" alt="CI" />
@@ -17,7 +17,14 @@
 
 Full kernel-level certificate unlock for Sandboxie-Plus **1.17.x–1.18.x** (tested on 1.17.9, 1.18.0, 1.18.2, 1.18.7 and 1.18.8) via a single `version.dll` proxy. No test-signing, no files needed in the install directory — everything is embedded in one DLL.
 
-**Windows x64 only** (the embedded kernel driver is 64-bit and the module enumeration uses x64 struct layouts). Tested on Windows 11 24H2 (Build 26100).
+**Windows x64 only** (the embedded kernel driver is 64-bit and the module enumeration uses x64 struct layouts). Tested on:
+
+| OS | Build | Sandboxie-Plus |
+|----|-------|----------------|
+| Windows 10 Pro 22H2 | 19045.6691 | 1.18.8 |
+| Windows 11 24H2 | 26100 | 1.17.9 – 1.18.8 |
+
+The self-map base lookup is independent of the Windows build: it was cross-checked against Microsoft public symbols on 19045 and 26100, where the global it picks is `nt!MmPteBase` on both.
 
 ## How it works
 
@@ -45,6 +52,8 @@ After a reboot the kernel patch is gone, but the hook stays in the installation 
 ## Driver blocklist
 
 Windows 11 22H2+ (including 24H2) ships the **Microsoft Vulnerable Driver Blocklist** enabled by default. It blocks the embedded Dell-signed helper driver (`dbutil_2_3.sys`) at load time with `StartService` error `0x800B010C`, even though the Authenticode signature is valid — the blocklist checks the binary hash, not the signature.
+
+Windows 10 keeps the same switch (`CI\Config\VulnerableDriverBlocklistEnable`) but ships it off, so the helper driver loads there without any change.
 
 To use the unlocker on a machine where the blocklist refuses the driver:
 
@@ -115,8 +124,15 @@ a writable section is written directly, a read-only one through a writable
 alias of the same physical frame (the PTE of a throwaway user page is
 repointed at it, so the original read-only mapping and its TLB entries stay
 untouched).  The page-table self-map base is randomized per boot since
-Windows 10 RS1 and is read from `nt!MmPteBase`, located by a code idiom in
-the mapped ntoskrnl and validated against an owned page before any write.
+Windows 10 RS1.  It is found the same way on every build: getting from an
+address to its PTE is always a shift plus a scale, so the code of the mapped
+ntoskrnl is scanned for references to globals that are followed by `shr 9` /
+`shl 3` / `lea *8`.  Those references vote for the global, and the busiest
+global whose value has the self-map shape (canonical, 64 GB aligned, PML4
+index in the kernel half) is the base - no compiler idiom is matched, so a
+new register or a `lea` does not break the lookup.  Finding nothing is a
+controlled refusal, never a guess, and the base is validated against an
+owned page before any write.
 Pre-RS1 kernels use the fixed classic base (gated on the OS build), 5-level
 paging (LA57) is refused, and on Memory Integrity the alias PTE is writable
 but non-executable to stay within the hypervisor's W^X rule.
@@ -168,7 +184,9 @@ sandboxie_unlocker/
 ├── _tests.bat         # Builds and runs the whole suite, non-zero exit on failure
 ├── _ptelive.bat       # Builds and runs the admin-only PTE live check
 ├── _build.bat         # MSVC build script (outputs to dist/)
+├── _msvc_env.bat      # Shared toolchain discovery for the three scripts above
 ├── .github/workflows/ # CI + release automation
+├── LICENSE            # MIT
 └── README.md
 ```
 
@@ -176,7 +194,7 @@ sandboxie_unlocker/
 
 `_tests.bat` builds and runs the suite (MSVC, no external dependencies). It is safe on any machine: kernel and live-Sandboxie paths are never exercised. Started without arguments (e.g. double-click) the console stays open after the run; pass any argument (CI) to exit immediately.
 
-- `selftest.c` — base64 vectors, ECDSA sign/verify round-trips via CNG, keypair persistence (blob + file with admin-DACL awareness), certificate body hash, PE offset→RVA mapping on a real file plus a synthetic SbieDrv-like fixture (original key, patched fallback, multi-magic, truncated key, bogus headers, writable/read-only section reporting), fileio edge cases, stale staging cleanup, certificate layout, restrictive DACL behavior per token elevation, safe-fail state machine, host-filter predicate, staged-driver byte verification, PTE alias math and the `nt!MmPteBase` reference scan, `.sig` backup policy, SbieDll-backed calls without Sandboxie, kernel module lookup smoke.
+- `selftest.c` — base64 vectors, ECDSA sign/verify round-trips via CNG, keypair persistence (blob + file with admin-DACL awareness), certificate body hash, PE offset→RVA mapping on a real file plus a synthetic SbieDrv-like fixture (original key, patched fallback, multi-magic, truncated key, bogus headers, writable/read-only section reporting, refusal of a key blob that crosses a section boundary), section-table offset arithmetic, fileio edge cases, logger append + rotation at the size cap, stale staging cleanup, certificate layout, restrictive DACL behavior per token elevation, safe-fail state machine, host-filter predicate, staged-driver byte verification, PTE alias math, the self-map base search and its reference ranking, `.sig` backup policy, SbieDll-backed calls without Sandboxie, kernel module lookup smoke.
 - `proxytest.c` — loads the built `dist\version.dll` into a non-SandMan process: all 17 exports resolvable, version-resource query round-trips through the real version.dll (FileVersion == build version), failure hosts degrade gracefully, host filter logs the skip line, host safe-fail registry state untouched.
 - `ptelive.c` (`_ptelive.bat`) — admin-only live check of the read-only-page write path, not part of the suite: stages and loads the embedded helper driver, locates and validates `nt!MmPteBase`, then writes through a page alias into a page this process made read-only and confirms the page is still read-only for user code.
 
@@ -190,4 +208,4 @@ CI runs the suite on every push (`.github/workflows/ci.yml`).
 | `Certificate.dat` | Self-signed certificate (ETERNAL, all features) |
 | `keypair.dat` | Saved ECDSA P-256 private key (reused after reboot) |
 | `sig_backup/` | Original `.exe.sig` files (refreshed while the installed pair is still vendor-signed) |
-| `version_hook.log` | Debug log with timestamps |
+| `version_hook.log` | Debug log with timestamps (rotated to `.old.log` at 1 MB) |

@@ -5,8 +5,8 @@
  * into .rdata - mapped read-only.  The helper driver memmove has no SEH, so
  * a direct write there bugchecks the box (0xBE).  Such pages are written
  * through a writable alias of the same physical frame; the page tables
- * self-map at a base Windows randomizes per boot, which is read from
- * nt!MmPteBase and validated before it is used.
+ * self-map at a base Windows randomizes per boot, which is found in the
+ * loaded image and validated before it is used.
  */
 #ifndef PAGEMAP_H
 #define PAGEMAP_H
@@ -15,15 +15,6 @@
 #include "log.h"
 #include "kdrv.h"
 #include "kmod.h"
-/* ------------------------------------------------------------------ */
-/*  Writes into read-only image pages                                 */
-/*                                                                    */
-/*  SbieDrv >= 1.18.7 declares KphpTrustedPublicKey const, which puts */
-/*  the key into .rdata - mapped read-only.  The helper driver's      */
-/*  memmove has no SEH, so a direct write would bugcheck the box      */
-/*  (ATTEMPTED_WRITE_TO_READONLY_MEMORY).  Such pages are written     */
-/*  through a writable alias of the same physical frame instead.      */
-/* ------------------------------------------------------------------ */
 
 /* 4-level x64 paging self-maps the page tables, so the PTE of *va*
  * sits at base + 8 * (packed indices); only the low 36 bits of
@@ -31,27 +22,22 @@
  * extension and must be masked off. */
 #define KDRV_VA_INDEX_MASK 0xFFFFFFFFFULL
 
-/* The self-map base is randomized per boot (Windows 10 RS1+), so it is
- * read from nt!MmPteBase.  The variable is not exported; it is located
- * by the code idiom `mov rax, [rip+MmPteBase]` / `shr r??, 9`.
+/* The self-map base is set at boot and kept in a kernel global; every
+ * PTE address is computed from it.  The global is found by how the code
+ * uses it, not by a byte pattern: getting from an address to its PTE is
+ * always `>> 12, * 8` in some spelling, so a reference to a global that is
+ * followed by shr 9 / shl 3 / lea *8 is a vote for that global.  The
+ * busiest global that holds a self-map shaped value is the base.
  *
- * shortcut: the scan accepts exactly that idiom and only in sections that
- * are executable and not discardable.  A kernel that compiles it
- * differently makes the lookup find nothing and the unlock stop with a
- * controlled error - it never guesses a base.  Upgrade if a future build
- * no longer matches (the log says "no PTE-base reference found"). */
-#define KDRV_MMPTE_PATTERN_LEN 11
+ * shortcut: a kernel that stops doing PTE arithmetic on the global makes
+ * the lookup find nothing and the unlock stop with a controlled error - it
+ * never guesses a base.  Upgrade if the log starts saying that. */
+#define KDRV_MAX_PTE_TARGETS 64
 
-/* Target of the 11-byte pattern at *p* (which lives at *va*), or 0 when
- * it is not a PTE-base reference: 48 8B 05 <disp32> 48 C1 E? 09. */
-static ULONG64 kdrv_pte_ref_target(const BYTE *p, ULONG64 va)
-{
-    if (p[0] != 0x48 || p[1] != 0x8B || p[2] != 0x05)
-        return 0;
-    if (p[7] != 0x48 || p[8] != 0xC1 || (p[9] & 0xF8) != 0xE8 || p[10] != 9)
-        return 0;
-    return va + 7 + (LONG)*(const INT32 *)(p + 3);
-}
+typedef struct {
+    ULONG64 target;   /* global that the code turns into a PTE address */
+    int refs;
+} kdrv_pte_target_t;
 
 /* Is *v* shaped like a 4-level self-map base (kernel-half PML4 entry,
  * everything below it zero)? */
@@ -78,48 +64,191 @@ static ULONG64 kdrv_alias_pte(ULONG64 src_pte)
            0x8000000000000000ULL;
 }
 
-/* Distinct reference targets and how often the idiom pointed at each. */
-#define KDRV_MAX_PTE_REFS 32
-
-typedef struct {
-    ULONG64 va;
-    int hits;
-} kdrv_pte_ref_t;
-
-/* Scan one code chunk for PTE-base references; hits must stay inside the
- * ntoskrnl image, so every later read of a target is a mapped read.  The
- * idiom is not exclusive to MmPteBase, so targets are collected with
- * their hit counts and the value shape decides later. */
-static void kdrv_pte_refs_in_chunk(const BYTE *code, ULONG64 chunk_va, ULONG len,
-                                   ULONG64 img_base, ULONG64 img_size,
-                                   kdrv_pte_ref_t *refs, int *ref_count)
+/* Opcodes that can address a global through [rip + disp32]. */
+static BOOL kdrv_is_mem_op(BYTE op)
 {
-    if (len < KDRV_MMPTE_PATTERN_LEN)
+    switch (op) {
+    case 0x01: case 0x03: case 0x09: case 0x0B: case 0x21: case 0x23:
+    case 0x29: case 0x2B: case 0x31: case 0x33: case 0x39: case 0x3B:
+    case 0x63: case 0x85: case 0x89: case 0x8B: case 0x8D: case 0x8F:
+    case 0xC7: case 0xFF:
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/* Does this short window turn an address into a PTE address?  shr r,9 (the
+ * 4-level index) and its shl r,3 / lea r,[r*8+..] spellings count. */
+static BOOL kdrv_pte_arith(const BYTE *p, ULONG len)
+{
+    for (ULONG i = 0; i + 4 <= len; i++) {
+        BYTE rex = p[i];
+        if (rex != 0x48 && rex != 0x49 && rex != 0x4C && rex != 0x4D)
+            continue;
+        if (p[i + 1] == 0xC1) {
+            BYTE modrm = p[i + 2];
+            if ((modrm & 0xF8) == 0xE8 && p[i + 3] == 9)   /* shr r,9 */
+                return TRUE;
+            if ((modrm & 0xF8) == 0xE0 && p[i + 3] == 3)   /* shl r,3 */
+                return TRUE;
+        } else if (p[i + 1] == 0x8D &&
+                   (p[i + 2] & 0xC7) == 0x04 && (p[i + 3] >> 6) == 3) {
+            return TRUE;                                   /* lea r,[r*8+..] */
+        }
+    }
+    return FALSE;
+}
+
+/* Record one reference to *target*, keeping the busiest globals. */
+static void kdrv_target_vote(kdrv_pte_target_t *t, int *count, ULONG64 target)
+{
+    int k = 0;
+    while (k < *count && t[k].target != target)
+        k++;
+
+    if (k == *count) {
+        if (*count < KDRV_MAX_PTE_TARGETS) {
+            (*count)++;
+        } else {
+            /* Table full: drop a single-hit entry, never a busy one. */
+            k = 0;
+            for (int i = 1; i < *count; i++) {
+                if (t[i].refs < t[k].refs)
+                    k = i;
+            }
+            if (t[k].refs > 1)
+                return;
+        }
+        t[k].target = target;
+        t[k].refs = 0;
+    }
+    t[k].refs++;
+}
+
+/* Count PTE-arithmetic references to globals in one code chunk. */
+static void kdrv_rank_refs(const BYTE *code, ULONG len, ULONG64 va,
+                           kdrv_pte_target_t *t, int *count)
+{
+    if (len < 8)
         return;
 
-    for (ULONG i = 0; i + KDRV_MMPTE_PATTERN_LEN <= len; i++) {
-        ULONG64 target = kdrv_pte_ref_target(code + i, chunk_va + i);
-        if (!target || target < img_base || target >= img_base + img_size)
+    for (ULONG i = 0; i + 8 <= len; i++) {
+        BYTE b = code[i];
+        if (b != 0x48 && b != 0x49 && b != 0x4C && b != 0x4D)
+            continue;
+        if (!kdrv_is_mem_op(code[i + 1]) || (code[i + 2] & 0xC7) != 0x05)
             continue;
 
-        int k;
-        for (k = 0; k < *ref_count; k++) {
-            if (refs[k].va == target) {
-                refs[k].hits++;
+        ULONG after = len - (i + 7);
+        if (after > 32)
+            after = 32;
+        if (!kdrv_pte_arith(code + i + 7, after))
+            continue;
+
+        INT32 disp;
+        memcpy(&disp, code + i + 3, sizeof(disp));
+        kdrv_target_vote(t, count, va + i + 7 + (ULONG64)(LONG64)disp);
+    }
+}
+
+typedef void (*kdrv_chunk_fn)(const BYTE *buf, ULONG len, ULONG64 va, void *ctx);
+
+/* Read one section in chunks and hand each chunk to *fn*.  Stops on a read
+ * error instead of walking into unmapped space. */
+static void kdrv_walk_sections(kdrv_t *d, const IMAGE_SECTION_HEADER *sec,
+                               ULONG sec_count, ULONG64 img_base, ULONG64 img_size,
+                               BOOL want_exec, BYTE *buf, ULONG chunk,
+                               ULONG overlap, kdrv_chunk_fn fn, void *ctx)
+{
+    for (ULONG s = 0; s < sec_count; s++) {
+        if (!!(sec[s].Characteristics & IMAGE_SCN_MEM_EXECUTE) != want_exec)
+            continue;
+        if (!sec[s].SizeOfRawData)
+            continue;
+        /* Discarded sections (INIT) may already be unmapped - reading
+         * them would fault the un-SEH'd helper driver. */
+        if (sec[s].Characteristics & IMAGE_SCN_MEM_DISCARDABLE)
+            continue;
+
+        ULONG64 sec_base = img_base + sec[s].VirtualAddress;
+        if (sec_base < img_base || sec_base >= img_base + img_size)
+            continue;   /* bogus section header must not steer the reads */
+        /* Never read padding past the mapping: the raw size can exceed
+         * the virtual size and the image end. */
+        ULONG span = sec[s].SizeOfRawData;
+        if (sec[s].Misc.VirtualSize && span > sec[s].Misc.VirtualSize)
+            span = sec[s].Misc.VirtualSize;
+        if (sec_base + span > img_base + img_size)
+            span = (ULONG)(img_base + img_size - sec_base);
+
+        ULONG left = span;
+        ULONG64 off = 0;
+        while (left) {
+            ULONG take = (left > chunk) ? chunk : left;
+            if (kdrv_read(d, sec_base + off, buf, take) != 0) {
+                LOGW("kdrv: section read failed at 0x%llX", sec_base + off);
                 break;
             }
-        }
-        if (k == *ref_count && *ref_count < KDRV_MAX_PTE_REFS) {
-            refs[*ref_count].va = target;
-            refs[*ref_count].hits = 1;
-            (*ref_count)++;
+            fn(buf, take, sec_base + off, ctx);
+            left -= take;
+            if (!left)
+                break;
+            off += (take > overlap) ? take - overlap : take;
         }
     }
 }
 
-/* Read nt!MmPteBase out of the loaded ntoskrnl image.  Returns the base
- * or 0; a failure is reported and leaves the unlock a controlled error,
- * never a fault in the helper driver. */
+/* Does *va* fall inside a section that is still mapped?  Only such an
+ * address may be read: a reference into a discarded INIT section would
+ * fault the driver.  The whole virtual size counts - globals live in the
+ * zero-filled tail of .data too, past the raw data. */
+static BOOL kdrv_target_mapped(const IMAGE_SECTION_HEADER *sec, ULONG sec_count,
+                               ULONG64 img_base, ULONG64 img_size, ULONG64 va)
+{
+    for (ULONG s = 0; s < sec_count; s++) {
+        if (sec[s].Characteristics & IMAGE_SCN_MEM_DISCARDABLE)
+            continue;
+        ULONG span = sec[s].Misc.VirtualSize;
+        if (span < sec[s].SizeOfRawData)
+            span = sec[s].SizeOfRawData;
+        if (!span)
+            continue;
+        ULONG64 start = img_base + sec[s].VirtualAddress;
+        if (start < img_base || start >= img_base + img_size)
+            continue;
+        if (start + span > img_base + img_size)
+            span = (ULONG)(img_base + img_size - start);
+        if (va >= start && va < start + span)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+typedef struct {
+    kdrv_pte_target_t *targets;
+    int count;
+} kdrv_rank_ctx_t;
+
+static void kdrv_chunk_rank(const BYTE *buf, ULONG len, ULONG64 va, void *ctx)
+{
+    kdrv_rank_ctx_t *c = (kdrv_rank_ctx_t *)ctx;
+    kdrv_rank_refs(buf, len, va, c->targets, &c->count);
+}
+
+/* Offset of the section table inside a PE image.  The NT headers start at
+ * e_lfanew, so that offset must be part of the sum: leaving it out reads
+ * the DOS stub as section headers, which only "works" while e_lfanew
+ * happens to be a multiple of sizeof(IMAGE_SECTION_HEADER) (= 40). */
+static ULONG kdrv_section_table_off(const IMAGE_DOS_HEADER *dos,
+                                    const IMAGE_NT_HEADERS64 *nt)
+{
+    return dos->e_lfanew + 4 + (ULONG)sizeof(IMAGE_FILE_HEADER) +
+           nt->FileHeader.SizeOfOptionalHeader;
+}
+
+/* Read the self-map base out of the loaded ntoskrnl image.  Returns the
+ * base or 0; a failure is reported and leaves the unlock a controlled
+ * error, never a fault in the helper driver. */
 static ULONG64 kdrv_locate_pte_base(kdrv_t *d)
 {
     ULONG img_size = 0;
@@ -149,17 +278,13 @@ static ULONG64 kdrv_locate_pte_base(kdrv_t *d)
         LOGE("kdrv_locate_pte_base: implausible section count %lu", sec_count);
         return 0;
     }
-    ULONG sec_off = 4 + sizeof(IMAGE_FILE_HEADER) + nt.FileHeader.SizeOfOptionalHeader;
-    if (kdrv_read(d, img_base + sec_off, sec, sec_count * sizeof(sec[0])) != 0) {
+    ULONG sec_off = kdrv_section_table_off(&dos, &nt);
+    if (sec_off + sec_count * (ULONG)sizeof(sec[0]) > 0x1000 ||
+        kdrv_read(d, img_base + sec_off, sec, sec_count * sizeof(sec[0])) != 0) {
         LOGE("kdrv_locate_pte_base: section table unreadable");
         return 0;
     }
 
-    kdrv_pte_ref_t refs[KDRV_MAX_PTE_REFS];
-    int ref_count = 0;
-
-    /* Chunked so a large section costs a fixed allocation; the overlap
-     * keeps a pattern that straddles a chunk boundary. */
     const ULONG CHUNK = 512 * 1024;
     BYTE *buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, CHUNK);
     if (!buf) {
@@ -167,83 +292,59 @@ static ULONG64 kdrv_locate_pte_base(kdrv_t *d)
         return 0;
     }
 
-    for (ULONG s = 0; s < sec_count; s++) {
-        if (!(sec[s].Characteristics & IMAGE_SCN_MEM_EXECUTE) || !sec[s].SizeOfRawData)
-            continue;
-        /* Discarded sections (INIT) may already be unmapped - reading
-         * them would fault the un-SEH'd helper driver. */
-        if (sec[s].Characteristics & IMAGE_SCN_MEM_DISCARDABLE)
-            continue;
-
-        ULONG64 sec_base = img_base + sec[s].VirtualAddress;
-        if (sec_base < img_base || sec_base >= img_base + img_size)
-            continue;   /* bogus section header must not steer the reads */
-        /* Never read padding past the mapping: the raw size can exceed
-         * the virtual size and the image end. */
-        ULONG span = sec[s].SizeOfRawData;
-        if (sec[s].Misc.VirtualSize && span > sec[s].Misc.VirtualSize)
-            span = sec[s].Misc.VirtualSize;
-        if (sec_base + span > img_base + img_size)
-            span = (ULONG)(img_base + img_size - sec_base);
-
-        ULONG left = span;
-        ULONG64 off = 0;
-        while (left) {
-            ULONG take = (left > CHUNK) ? CHUNK : left;
-            if (kdrv_read(d, sec_base + off, buf, take) != 0) {
-                LOGW("kdrv_locate_pte_base: section read failed at 0x%llX", sec_base + off);
-                break;
-            }
-            kdrv_pte_refs_in_chunk(buf, sec_base + off, take, img_base, img_size,
-                                   refs, &ref_count);
-
-            left -= take;
-            if (!left)
-                break;   /* last chunk of this section: nothing left to overlap */
-            off += take - (KDRV_MMPTE_PATTERN_LEN - 1);   /* keep a pattern that straddles */
-        }
-    }
+    kdrv_pte_target_t targets[KDRV_MAX_PTE_TARGETS];
+    kdrv_rank_ctx_t ctx = { targets, 0 };
+    kdrv_walk_sections(d, sec, sec_count, img_base, img_size, TRUE,
+                       buf, CHUNK, 8, kdrv_chunk_rank, &ctx);
     HeapFree(GetProcessHeap(), 0, buf);
 
-    if (!ref_count) {
-        LOGE("kdrv_locate_pte_base: no PTE-base reference found (image size 0x%lX)", img_size);
+    if (!ctx.count) {
+        LOGE("kdrv_locate_pte_base: no PTE arithmetic on a global in the code");
         return 0;
     }
-    if (ref_count == KDRV_MAX_PTE_REFS)
-        LOGW("kdrv_locate_pte_base: reference table full, later targets skipped");
 
-    /* The idiom is shared with other kernel globals, so the value shape
-     * decides: read each distinct target (inside the image, hence mapped)
-     * most-referenced first and take the first self-map shaped value. */
+    /* Busiest global first; the first one holding a self-map shaped value
+     * is the base.  A mis-decoded reference costs one safe read, nothing
+     * more - the value shape decides, and a non-match is skipped. */
     ULONG64 base = 0;
-    for (int i = 0; i < ref_count; i++) {
-        int best = i;
-        for (int j = i + 1; j < ref_count; j++) {
-            if (refs[j].hits > refs[best].hits)
-                best = j;
+    ULONG64 base_va = 0;
+    int base_refs = 0;
+    for (int rank = 0; rank < ctx.count && !base; rank++) {
+        int best = rank;
+        for (int i = rank + 1; i < ctx.count; i++) {
+            if (targets[i].refs > targets[best].refs)
+                best = i;
         }
-        kdrv_pte_ref_t tmp = refs[i];
-        refs[i] = refs[best];
-        refs[best] = tmp;
+        kdrv_pte_target_t t = targets[best];
+        targets[best] = targets[rank];
+        targets[rank] = t;
 
+        if (!kdrv_target_mapped(sec, sec_count, img_base, img_size, t.target)) {
+            LOGW("kdrv_locate_pte_base: target 0x%llX (RVA 0x%llX) is outside a live section",
+                 t.target, t.target - img_base);
+            continue;
+        }
         ULONG64 v = 0;
-        if (kdrv_read(d, refs[i].va, &v, sizeof(v)) != 0) {
-            LOGW("kdrv_locate_pte_base: target 0x%llX unreadable", refs[i].va);
+        if (kdrv_read(d, t.target, &v, sizeof(v)) != 0) {
+            LOGW("kdrv_locate_pte_base: target 0x%llX unreadable", t.target);
             continue;
         }
-        if (!kdrv_is_pte_base(v)) {
-            LOGW("kdrv_locate_pte_base: target 0x%llX holds 0x%llX - not a self-map base",
-                 refs[i].va, v);
-            continue;
+        LOGI("PTE-arithmetic global at RVA 0x%llX: %d reference(s), value 0x%llX",
+             t.target - img_base, t.refs, v);
+        if (kdrv_is_pte_base(v)) {
+            base = v;
+            base_va = t.target;
+            base_refs = t.refs;
         }
-        LOGI("nt!MmPteBase at RVA 0x%llX = 0x%llX (%d reference(s))",
-             refs[i].va - img_base, v, refs[i].hits);
-        base = v;
-        break;
     }
 
-    if (!base)
-        LOGE("kdrv_locate_pte_base: no self-map base among %d distinct target(s)", ref_count);
+    if (!base) {
+        LOGE("kdrv_locate_pte_base: no self-map shaped value among %d target(s)",
+             ctx.count);
+        return 0;
+    }
+    LOGI("nt!MmPteBase at RVA 0x%llX = 0x%llX (%d reference(s))",
+         base_va - img_base, base, base_refs);
     return base;
 }
 
@@ -265,7 +366,8 @@ static BOOL kdrv_validate_pte_base(kdrv_t *d, ULONG64 base)
     ULONG64 probe_pte = 0;
     BOOL ok = kdrv_read(d, kdrv_pte_va(base, (ULONG64)(ULONG_PTR)probe),
                         &probe_pte, sizeof(probe_pte)) == 0 &&
-              (probe_pte & 0x1) && (probe_pte & 0x2) && (probe_pte & 0x4);
+              (probe_pte & 0x1) && (probe_pte & 0x2) && (probe_pte & 0x4) &&
+              (probe_pte & 0x000FFFFFFFFFF000ULL);   /* a real frame, not junk */
     if (ok)
         LOGI("PTE base 0x%llX validated against an owned page", base);
     else
@@ -427,6 +529,5 @@ out:
         LOGW("kdrv_page_write: alias PTE left in place, pages leaked on purpose");
     return rc;
 }
-
 
 #endif /* PAGEMAP_H */

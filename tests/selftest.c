@@ -18,7 +18,7 @@
  *   safety     safe-fail state machine (interrupted attempts, safe mode)
  *   host       SandMan host predicate
  *   kdrv       staged helper driver content verification
- *   pte        PTE alias math + nt!MmPteBase reference scan
+ *   pte        PTE alias math + self-map base vote scan
  *   sigbak     .sig backup policy (refresh / keep / warn)
  *   sbieapi    SbieDll-backed calls fail cleanly without Sandboxie
  *   kmod       kernel module lookup smoke
@@ -415,6 +415,31 @@ static void test_pe_fixture(void)
     CHECK(pe_find_key_rva(path) == 0x1000 + (truncOff - 0x200),
           "fixture F: truncated key falls back to magic");
 
+    /* G: key blob crossing a section boundary.  The section holding the
+     * first byte is read-only, the tail lands in a writable one: writing
+     * through the reported permission would hit the read-only half and
+     * bugcheck, so the finder must refuse instead of returning half a
+     * truth. */
+    pe_fixture_headers(buf);
+    {
+        IMAGE_NT_HEADERS64 *nt2 = (IMAGE_NT_HEADERS64 *)(buf + 0x40);
+        nt2->FileHeader.NumberOfSections = 2;
+        IMAGE_SECTION_HEADER *s = IMAGE_FIRST_SECTION(nt2);
+        memcpy(s[0].Name, ".rdata", 7);
+        s[0].VirtualAddress = 0x1000;
+        s[0].SizeOfRawData = 0x400;
+        s[0].PointerToRawData = 0x200;          /* raw 0x200..0x5FF */
+        s[0].Characteristics = IMAGE_SCN_MEM_READ;
+        memcpy(s[1].Name, ".data", 6);
+        s[1].VirtualAddress = 0x2000;
+        s[1].SizeOfRawData = 0x400;
+        s[1].PointerToRawData = 0x600;          /* raw 0x600..0x9FF */
+        s[1].Characteristics = IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE;
+        memcpy(buf + 0x5D0, ORIGINAL_KEY, sizeof(ORIGINAL_KEY));  /* crosses 0x600 */
+    }
+    CHECKV(write_file_simple(path, buf, sizeof(buf)), "fixture G write");
+    CHECK(pe_find_key_rva(path) == 0, "fixture G: blob across sections -> 0");
+
     DeleteFileA(path);
 }
 
@@ -789,53 +814,88 @@ static void test_pte(void)
     CHECK(!kdrv_is_pte_base(0xFFFFF88000001000ULL), "page offset rejected");
     CHECK(!kdrv_is_pte_base(0x0000F88000000000ULL), "user-half value rejected");
 
-    /* mm!MmPteBase reference idiom, bytes taken from the live 24H2 kernel
-     * (ntoskrnl .text RVA 0x504E31 points at nt!MmPteBase, RVA 0xFC44C8). */
-    static const BYTE ref[KDRV_MMPTE_PATTERN_LEN] = {
-        0x48, 0x8B, 0x05, 0x90, 0xF6, 0xAB, 0x00, 0x48, 0xC1, 0xEB, 0x09
-    };
-    CHECK(kdrv_pte_ref_target(ref, 0x504E31) == 0xFC44C8, "reference resolves to MmPteBase RVA");
-
-    BYTE bad[KDRV_MMPTE_PATTERN_LEN];
-    memcpy(bad, ref, sizeof(bad));
-    bad[2] = 0x0D;                       /* mov rcx, not rax */
-    CHECK(kdrv_pte_ref_target(bad, 0x504E31) == 0, "other register rejected");
-    memcpy(bad, ref, sizeof(bad));
-    bad[10] = 0x0C;                      /* shr by 12, not 9 */
-    CHECK(kdrv_pte_ref_target(bad, 0x504E31) == 0, "other shift rejected");
-    memcpy(bad, ref, sizeof(bad));
-    bad[0] = 0x4C;                       /* not a RIP-relative load */
-    CHECK(kdrv_pte_ref_target(bad, 0x504E31) == 0, "other opcode rejected");
-
-    /* Chunk scan keeps only references into the ntoskrnl image. */
-    kdrv_pte_ref_t refs[KDRV_MAX_PTE_REFS];
-    int ref_count = 0;
+    /* PTE arithmetic votes for the global it is applied to.  Addresses are
+     * the live 24H2 ones (.text 0x504E31 -> nt!MmPteBase at 0xFC44C8). */
+    kdrv_pte_target_t targets[KDRV_MAX_PTE_TARGETS];
+    int target_count = 0;
+    const ULONG64 storage = 0xFFFFF80000FC44C8ULL;
+    const ULONG64 code_va = 0xFFFFF80000504E31ULL;
+    INT32 disp = (INT32)(storage - (code_va + 7));
     BYTE code[64];
+
     memset(code, 0x90, sizeof(code));
-    memcpy(code + 16, ref, sizeof(ref));
-    /* Image base chosen so the target lands on the live MmPteBase RVA. */
-    const ULONG64 img = 0x400000ULL;
-    ULONG64 code_va = img + 0x504E21ULL;   /* pattern at +16 -> ref at 0x504E31 */
-    kdrv_pte_refs_in_chunk(code, code_va, sizeof(code),
-                           img, 0x2000000ULL, refs, &ref_count);
-    CHECK(ref_count == 1 && refs[0].va == img + 0xFC44C8 && refs[0].hits == 1,
-          "in-image reference collected");
+    code[0] = 0x48; code[1] = 0x8B; code[2] = 0x05;    /* mov rax, [rip+disp] */
+    memcpy(code + 3, &disp, sizeof(disp));
+    code[7] = 0x48; code[8] = 0xC1; code[9] = 0xEB; code[10] = 0x09;  /* shr rbx,9 */
+    kdrv_rank_refs(code, sizeof(code), code_va, targets, &target_count);
+    CHECK(target_count == 1 && targets[0].target == storage && targets[0].refs == 1,
+          "live 24H2 reference votes for MmPteBase");
 
-    /* A second reference to the same variable must merge into one vote. */
-    memcpy(code + 32, ref, sizeof(ref));
-    code[32 + 3] = 0x80;                   /* same target from the later site */
-    code[32 + 4] = 0xF6;
-    code[32 + 5] = 0xAB;
-    code[32 + 6] = 0x00;
-    ref_count = 0;
-    kdrv_pte_refs_in_chunk(code, code_va, sizeof(code),
-                           img, 0x2000000ULL, refs, &ref_count);
-    CHECK(ref_count == 1 && refs[0].hits == 2, "repeated reference aggregated");
+    kdrv_rank_refs(code, sizeof(code), code_va, targets, &target_count);
+    CHECK(target_count == 1 && targets[0].refs == 2, "repeated reference adds a vote");
 
-    ref_count = 0;
-    kdrv_pte_refs_in_chunk(code, code_va, sizeof(code),
-                           0xC0000000, 0x10000, refs, &ref_count);
-    CHECK(ref_count == 0, "reference outside the image dropped");
+    memset(code, 0x90, sizeof(code));
+    code[0] = 0x4C; code[1] = 0x8B; code[2] = 0x0D;    /* mov r9, [rip+disp] */
+    memcpy(code + 3, &disp, sizeof(disp));
+    code[7] = 0x48; code[8] = 0xC1; code[9] = 0xEA; code[10] = 0x09;  /* shr rdx,9 */
+    target_count = 0;
+    kdrv_rank_refs(code, sizeof(code), code_va, targets, &target_count);
+    CHECK(target_count == 1 && targets[0].target == storage, "another register is scored");
+
+    memset(code, 0x90, sizeof(code));
+    code[0] = 0x48; code[1] = 0x8B; code[2] = 0x05;    /* plain load, no PTE math */
+    memcpy(code + 3, &disp, sizeof(disp));
+    code[7] = 0x48; code[8] = 0x8B; code[9] = 0xCB;
+    target_count = 0;
+    kdrv_rank_refs(code, sizeof(code), code_va, targets, &target_count);
+    CHECK(target_count == 0, "a global without PTE arithmetic gets no vote");
+
+    memset(code, 0x90, sizeof(code));
+    code[0] = 0x48; code[1] = 0x8B; code[2] = 0x05;    /* mov rax, [rip+disp] */
+    memcpy(code + 3, &disp, sizeof(disp));
+    code[7] = 0x48; code[8] = 0x8D; code[9] = 0x1C; code[10] = 0xDD;
+    code[11] = 0; code[12] = 0; code[13] = 0; code[14] = 0;  /* lea rbx,[rbx*8] */
+    target_count = 0;
+    kdrv_rank_refs(code, sizeof(code), code_va, targets, &target_count);
+    CHECK(target_count == 1 && targets[0].target == storage, "lea *8 spelling scores");
+
+    /* The section table offset must include e_lfanew.  ntoskrnl's 0x118 is
+     * a multiple of 40, so an omitted e_lfanew still lands on real section
+     * headers 7 entries late - this exact bug shipped and only showed up
+     * when the arithmetic was checked against the header by hand. */
+    IMAGE_DOS_HEADER tdos;
+    IMAGE_NT_HEADERS64 tnt;
+    memset(&tdos, 0, sizeof(tdos));
+    memset(&tnt, 0, sizeof(tnt));
+    tnt.FileHeader.SizeOfOptionalHeader = 0xF0;
+    tdos.e_lfanew = 0x118;
+    CHECK(kdrv_section_table_off(&tdos, &tnt) == 0x118 + 24 + 0xF0,
+          "section table offset includes e_lfanew (ntoskrnl layout)");
+    tdos.e_lfanew = 0xF8;
+    CHECK(kdrv_section_table_off(&tdos, &tnt) == 0xF8 + 24 + 0xF0,
+          "section table offset follows e_lfanew");
+
+    /* Only live sections may be read: a global in the zero-filled tail of a
+     * section counts, a discarded INIT section never does. */
+    IMAGE_SECTION_HEADER secs[2];
+    memset(secs, 0, sizeof(secs));
+    secs[0].VirtualAddress = 0x1000;
+    secs[0].Misc.VirtualSize = 0x2000;      /* raw data ends at 0x2000 */
+    secs[0].SizeOfRawData = 0x1000;
+    secs[0].Characteristics = IMAGE_SCN_MEM_READ | IMAGE_SCN_CNT_INITIALIZED_DATA;
+    secs[1].VirtualAddress = 0x5000;
+    secs[1].Misc.VirtualSize = 0x1000;
+    secs[1].SizeOfRawData = 0x1000;
+    secs[1].Characteristics = IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_DISCARDABLE;
+    const ULONG64 img2 = 0xFFFFF80000000000ULL;
+    const ULONG64 img2_size = 0x10000ULL;
+
+    CHECK(kdrv_target_mapped(secs, 2, img2, img2_size, img2 + 0x1800),
+          "a global in the uninitialised tail is readable");
+    CHECK(!kdrv_target_mapped(secs, 2, img2, img2_size, img2 + 0x5800),
+          "a discarded section is not readable");
+    CHECK(!kdrv_target_mapped(secs, 2, img2, img2_size, img2 + 0x9000),
+          "an address outside every section is rejected");
 }
 
 /* ---------------- .sig backup policy ---------------- */
@@ -996,6 +1056,31 @@ static void test_log(void)
     DWORD mid = file_size(logp);
     LOGW("%s", big);
     CHECK(file_size(logp) > mid, "oversized message truncated safely");
+
+    /* A full log rotates to .old.log once per process instead of growing
+     * without bound. */
+    char oldp[MAX_PATH];
+    strcpy_s(oldp, MAX_PATH, logp);
+    char *dot = strrchr(oldp, '.');
+    if (dot) strcpy_s(dot, MAX_PATH - (dot - oldp), ".old.log");
+    DeleteFileA(oldp);
+
+    HANDLE h = CreateFileA(logp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
+    CHECK(h != INVALID_HANDLE_VALUE, "rotate fixture created");
+    if (h != INVALID_HANDLE_VALUE) {
+        static char chunk[65536];
+        memset(chunk, 'z', sizeof(chunk));
+        DWORD written;
+        for (int i = 0; i < 17; i++)          /* 1 MB + 64 KB: over the cap */
+            WriteFile(h, chunk, sizeof(chunk), &written, NULL);
+        CloseHandle(h);
+    }
+    strcpy_s(g_log_path, MAX_PATH, logp);
+    log_rotate();
+    CHECK(file_size(logp) == 0, "full log moved away");
+    CHECK(file_size(oldp) > LOG_MAX_BYTES, "previous log kept as .old.log");
+    DeleteFileA(oldp);
 }
 
 int main(int argc, char **argv)

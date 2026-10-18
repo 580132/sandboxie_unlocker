@@ -3,8 +3,10 @@ setlocal enabledelayedexpansion
 title Sandboxie-Plus Unlocker
 
 :: ===== Admin check =====
+:: net session needs the Server service, so fall back to a plain admin probe.
 net session >nul 2>&1
-if %errorlevel% neq 0 (
+if %errorlevel% neq 0 fltmc >nul 2>&1
+if errorlevel 1 (
     echo [^^!] Administrator rights required.
     echo     Right-click this file and select "Run as administrator".
     echo.
@@ -105,6 +107,8 @@ copy /Y "%DLL_SRC%" "%SBIE_DIR%\version.dll" >nul 2>&1
 if errorlevel 1 (
     echo [-] Failed to copy version.dll - file may be locked.
     echo     Close all Sandboxie processes and try again.
+    :: put the UI the user already had back
+    start "" "%SBIE_DIR%\SandMan.exe"
     pause
     goto menu
 )
@@ -134,12 +138,10 @@ echo                    REMOVE HOOK
 echo ============================================================
 echo.
 
-:: === Clean up staging artifacts from previous runs ===
-:: NOTE: intentionally placed AFTER the process stop sequence below.
+:: === Staging artifacts need the stop sequence above ===
 :: A live DLL may be between writing the temp driver and loading it;
 :: deleting the file inside that window breaks the load.  After the
-:: stop sequence no unlock thread is running.  Locked files (image-
-:: mapped) are skipped; they are retried after reboot.
+:: stop sequence no unlock thread is running.
 if not exist "%SBIE_DIR%\version.dll" (
     echo    version.dll not found - hook is not installed.
     echo.
@@ -247,18 +249,25 @@ if "!deleted!"=="1" (
     echo        Close all Sandboxie processes, reboot, and run Remove Hook again.
 )
 
-:: Restore original .sig files from backup
+:: Restore original .sig files from backup.  The backup is kept when the
+:: copy fails, otherwise removal would destroy the only good copies.
 if exist "%SBIE_DIR%\sig_backup" (
     echo    Restoring original .sig files...
     copy /Y "%SBIE_DIR%\sig_backup\*.sig" "%SBIE_DIR%\" >nul 2>&1
-    rmdir /s /q "%SBIE_DIR%\sig_backup" >nul 2>&1
-    echo    Done.
+    if errorlevel 1 (
+        set "reboot_required=1"
+        echo    [-] Could not restore - backups kept in sig_backup.
+    ) else (
+        rmdir /s /q "%SBIE_DIR%\sig_backup" >nul 2>&1
+        echo    Done.
+    )
 )
 
 :: Clean up generated files
 del /f /q "%SBIE_DIR%\Certificate.dat"   >nul 2>&1
 del /f /q "%SBIE_DIR%\keypair.dat"       >nul 2>&1
 del /f /q "%SBIE_DIR%\version_hook.log"  >nul 2>&1
+del /f /q "%SBIE_DIR%\version_hook.old.log" >nul 2>&1
 
 :: Reset safe-fail state
 reg delete "HKCU\SOFTWARE\sandboxie_unlocker" /f >nul 2>&1
@@ -291,7 +300,11 @@ if "!reboot_required!"=="0" (
     if "!dll_locked!"=="1" (
         echo    version.dll is still locked - after reboot, run Remove Hook again to delete it.
     )
-    echo    Original .sig files have been restored.
+    if exist "%SBIE_DIR%\sig_backup" (
+        echo    Original .sig files are still in sig_backup - copy them back after reboot.
+    ) else (
+        echo    Original .sig files have been restored.
+    )
     echo    After reboot, Sandboxie-Plus works normally.
     echo.
     echo [+] Please reboot to complete removal.

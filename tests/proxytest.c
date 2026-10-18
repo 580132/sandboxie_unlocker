@@ -85,12 +85,16 @@ static BOOL log_has_marker_after(DWORD offset, const char *marker)
 
 static DWORD reg_attempt_active(void)
 {
+    /* 0xFFFFFFFF = "value absent"; a wrong type or a failed query means the
+     * same, so the caller compares like with like. */
     DWORD v = 0xFFFFFFFF, sz = sizeof(v), type = 0;
     HKEY k;
     if (RegOpenKeyExA(HKEY_CURRENT_USER, "SOFTWARE\\sandboxie_unlocker",
                       0, KEY_READ, &k) == ERROR_SUCCESS) {
-        RegQueryValueExA(k, "attempt_active", NULL, &type,
-                         (LPBYTE)&v, &sz);
+        if (RegQueryValueExA(k, "attempt_active", NULL, &type,
+                             (LPBYTE)&v, &sz) != ERROR_SUCCESS ||
+            type != REG_DWORD || sz != sizeof(v))
+            v = 0xFFFFFFFF;
         RegCloseKey(k);
     }
     return v;
@@ -197,6 +201,9 @@ int main(int argc, char **argv)
     CHECK(log_has_marker_after(logBefore, "not SandMan.exe"),
           "log gains non-SandMan filter line");
     DWORD activeAfter = reg_attempt_active();
+    /* cppcheck (--check-level=exhaustive) cannot model WinAPI
+     * out-parameters and believes the helper always reports "absent". */
+    // cppcheck-suppress knownConditionTrueFalse
     if (activeBefore == 0xFFFFFFFF)
         CHECK(activeAfter == 0xFFFFFFFF, "no safe-fail key created");
     else

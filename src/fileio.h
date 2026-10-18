@@ -24,16 +24,26 @@ static BOOL read_file_all(const char *path, BYTE **out, DWORD *out_size, DWORD m
     DWORD size = GetFileSize(hFile, NULL);
     if (size == INVALID_FILE_SIZE || size == 0 || size > max_size) {
         CloseHandle(hFile);
+        SetLastError(ERROR_INVALID_DATA);   /* empty, huge or unreadable */
         return FALSE;
     }
 
     BYTE *buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, size);
-    if (!buf) { CloseHandle(hFile); return FALSE; }
+    if (!buf) {
+        CloseHandle(hFile);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return FALSE;
+    }
 
     DWORD got = 0;
-    BOOL ok = ReadFile(hFile, buf, size, &got, NULL) && got == size;
+    BOOL ok = ReadFile(hFile, buf, size, &got, NULL);
+    DWORD err = ok ? ERROR_INVALID_DATA : GetLastError();  /* short read */
     CloseHandle(hFile);
-    if (!ok) { HeapFree(GetProcessHeap(), 0, buf); return FALSE; }
+    if (!ok || got != size) {
+        HeapFree(GetProcessHeap(), 0, buf);
+        SetLastError(err);
+        return FALSE;
+    }
 
     *out = buf;
     *out_size = size;
@@ -60,22 +70,23 @@ static void cleanup_stale_temp_drivers(const char *tempDir)
 
     FILETIME nowFt;
     GetSystemTimeAsFileTime(&nowFt);
+    const ULONG64 now64 = ((ULONG64)nowFt.dwHighDateTime << 32) | nowFt.dwLowDateTime;
 
     static const ULONG64 TICKS_PER_SEC = 10000000;
 
-    UINT removed = 0, locked = 0;
+    UINT removed = 0, skipped = 0;
     do {
         char p[MAX_PATH];
-        strcpy_s(p, MAX_PATH, tempDir);
-        strcat_s(p, MAX_PATH, "\\");
-        strcat_s(p, MAX_PATH, fd.cFileName);
+        /* Truncation, not strcat_s: a hostile long file name in %WINDIR%\Temp
+         * would otherwise hit the CRT invalid-parameter handler and kill the
+         * host process.  A truncated path simply fails to open. */
+        _snprintf_s(p, MAX_PATH, _TRUNCATE, "%s\\%s", tempDir, fd.cFileName);
 
-        ULONG64 now64 = ((ULONG64)nowFt.dwHighDateTime << 32) | nowFt.dwLowDateTime;
         ULONG64 file64 = ((ULONG64)fd.ftLastWriteTime.dwHighDateTime << 32) |
                           fd.ftLastWriteTime.dwLowDateTime;
         ULONG64 ageSec = (now64 > file64) ? (now64 - file64) / TICKS_PER_SEC : 0;
         if (ageSec < REUSE_GRACE_SEC) {
-            locked++;
+            skipped++;   /* may belong to an instance that has not loaded yet */
             continue;
         }
 
@@ -85,12 +96,12 @@ static void cleanup_stale_temp_drivers(const char *tempDir)
             CloseHandle(h);
             removed++;
         } else {
-            locked++;
+            skipped++;   /* held by a staging writer or a live image section */
         }
     } while (FindNextFileA(hFind, &fd));
     FindClose(hFind);
 
-    LOGI("Stale temp drivers: removed %u, locked %u", removed, locked);
+    LOGI("Stale temp drivers: removed %u, skipped %u", removed, skipped);
 }
 
 #endif /* FILEIO_H */

@@ -10,8 +10,11 @@
 #include <windows.h>
 #include "fileio.h"
 
+/* Key blob size: ECS1 header + P-256 public point. */
+#define KEY_SIZE 72
+
 /* The original KphpTrustedPublicKey[72] from verify.c */
-static const BYTE ORIGINAL_KEY[72] = {
+static const BYTE ORIGINAL_KEY[KEY_SIZE] = {
     0x45, 0x43, 0x53, 0x31, 0x20, 0x00, 0x00, 0x00,
     0x05, 0x7A, 0x12, 0x5A, 0xF8, 0x54, 0x01, 0x42,
     0xDB, 0x19, 0x87, 0xFC, 0xC4, 0xE3, 0xD3, 0x8D,
@@ -44,7 +47,8 @@ static ULONG pe_offset_to_rva_ex(const BYTE *pe_data, DWORD data_size, DWORD fil
     IMAGE_NT_HEADERS64 *nt = (IMAGE_NT_HEADERS64 *)(pe_data + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
 
-    DWORD secTableOff = dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64);
+    DWORD secTableOff = dos->e_lfanew + 4 + (DWORD)sizeof(IMAGE_FILE_HEADER) +
+                        nt->FileHeader.SizeOfOptionalHeader;
     DWORD secTableSize = (DWORD)nt->FileHeader.NumberOfSections * sizeof(IMAGE_SECTION_HEADER);
     if (secTableOff > data_size || secTableSize > data_size - secTableOff) return 0;
 
@@ -87,7 +91,7 @@ static ULONG pe_find_key_rva_ex(const char *driver_path, BOOL *section_writable)
     for (DWORD i = 0; i + 8 <= fileSize; i++) {
         if (!magicOffset && memcmp(data + i, ECS1_PATTERN, 8) == 0)
             magicOffset = i;
-        if (i + 72 <= fileSize && memcmp(data + i, ORIGINAL_KEY, 72) == 0) {
+        if (i + KEY_SIZE <= fileSize && memcmp(data + i, ORIGINAL_KEY, KEY_SIZE) == 0) {
             origOffset = i;
             break;
         }
@@ -95,8 +99,22 @@ static ULONG pe_find_key_rva_ex(const char *driver_path, BOOL *section_writable)
     DWORD offset = origOffset ? origOffset : magicOffset;
 
     ULONG rva = 0;
-    if (offset)
-        rva = pe_offset_to_rva_ex(data, fileSize, offset, section_writable);
+    BOOL writable = TRUE;
+    if (offset) {
+        rva = pe_offset_to_rva_ex(data, fileSize, offset, &writable);
+        /* The whole blob must sit in one section: a key straddling a
+         * boundary would report the wrong permission, and a direct write
+         * into a read-only half is the 0xBE bugcheck. */
+        BOOL end_writable = writable;
+        ULONG end_rva = rva ? pe_offset_to_rva_ex(data, fileSize,
+                                                  offset + KEY_SIZE - 1,
+                                                  &end_writable) : 0;
+        if (!rva || end_writable != writable || end_rva != rva + KEY_SIZE - 1) {
+            LOGE("pe_find_key_rva: key blob crosses a section boundary - refusing");
+            rva = 0;
+        }
+    }
+    if (section_writable) *section_writable = writable;
 
     HeapFree(GetProcessHeap(), 0, data);
     return rva;

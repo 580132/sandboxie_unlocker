@@ -6,6 +6,7 @@
 
 #include <windows.h>
 #include <winternl.h>
+#include <ctype.h>
 #include "log.h"
 
 #define SystemModuleInformation 11
@@ -14,6 +15,12 @@
  * Returns TRUE when the privilege is present and was enabled. */
 static BOOL kmod_enable_debug_privilege(void)
 {
+    /* One attempt per process: the unlock thread looks modules up in a
+     * 60-try loop, and a token adjust per call is pointless. */
+    static BOOL tried = FALSE, cached = FALSE;
+    if (tried) return cached;
+    tried = TRUE;
+
     HANDLE hToken;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &hToken)) {
         LOGW("kmod: OpenProcessToken failed: %lu", GetLastError());
@@ -33,6 +40,7 @@ static BOOL kmod_enable_debug_privilege(void)
         LOGW("kmod: LookupPrivilegeValue failed: %lu", GetLastError());
     }
     CloseHandle(hToken);
+    cached = ok;
     return ok;
 }
 

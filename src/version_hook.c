@@ -262,7 +262,7 @@ static BOOL write_driver_temp(const char *path)
         return FALSE;
     }
 
-    DWORD written;
+    DWORD written = 0;
     BOOL ok = WriteFile(hFile, g_driver_bin, g_driver_size, &written, NULL);
     CloseHandle(hFile);
     if (!ok || written != g_driver_size) {
@@ -360,12 +360,14 @@ static int patch_kernel_key(kdrv_t *drv, ULONG64 keyVa, BOOL alreadyPatched,
 
     /* Direct write when the key's section is writable in the file on disk
      * (SbieDrv <= 1.18.6), an alias write for the read-only .rdata of
-     * 1.18.7+ - see pagemap.h. */
+     * 1.18.7+ - see pagemap.h.  The file is assumed to describe the loaded
+     * image; a gross mismatch is caught earlier by the image-size and ECS1
+     * checks, and the alias path re-reads the live PTE anyway. */
     int wr = key_writable ? kdrv_write(drv, keyVa, newBlob, BLOB_SIZE)
                           : kdrv_page_write(drv, keyVa, newBlob, BLOB_SIZE);
     if (wr != 0) {
-        LOGE("key write failed at key VA 0x%llX (%s section)", keyVa,
-             key_writable ? "writable" : "read-only");
+        LOGE("key write failed at key VA 0x%llX (%s section, code %d)", keyVa,
+             key_writable ? "writable" : "read-only", wr);
         return ERR_WRITE_KEY;
     }
     LOGI("Public key written to kernel memory");
@@ -403,6 +405,11 @@ static DWORD WINAPI unlock_thread(LPVOID param)
     log_init();
 
     LOGI("Sandboxie-Plus Unlocker v%s by %s", SBIE_UNLOCKER_VERSION, SBIE_UNLOCKER_AUTHOR);
+
+    /* The real version.dll is loaded here, not in DllMain: LoadLibrary
+     * under the loader lock can deadlock.  Export stubs retry on their
+     * own, so no caller ever sees an unresolved forward. */
+    load_real_version();
 
     /* Only SandMan.exe performs the unlock; others skip silently. */
     if (!is_sandman_process()) {
@@ -454,7 +461,9 @@ static DWORD WINAPI unlock_thread(LPVOID param)
     for (int attempt = 0; attempt < 60; attempt++) {
         sbieBase = kmod_find("sbiedrv", &imgSize);
         if (sbieBase) break;
-        LOGW("SbieDrv.sys not in kernel yet, retry %d/60...", attempt + 1);
+        /* One line per second would bury the rest of the log. */
+        if (attempt < 3 || attempt % 10 == 9)
+            LOGW("SbieDrv.sys not in kernel yet, retry %d/60...", attempt + 1);
         Sleep(1000);
     }
     if (!sbieBase) { LOGE("SbieDrv.sys not found in kernel after 60 retries"); err = ERR_NOT_IN_KERNEL; goto cleanup; }
@@ -571,7 +580,6 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hinst);
         g_self_module = hinst;
-        load_real_version();
         HANDLE hThread = CreateThread(NULL, 0, unlock_thread, NULL, 0, NULL);
         if (hThread) CloseHandle(hThread);
         else LOGE("CreateThread (unlock) failed: %lu", GetLastError());

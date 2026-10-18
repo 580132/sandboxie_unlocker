@@ -15,6 +15,7 @@ dist/version.dll
 
 # Runtime artifacts
 version_hook.log
+version_hook.old.log
 keypair.dat
 sig_backup/
 Certificate.dat

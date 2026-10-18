@@ -178,7 +178,7 @@ static int ec_save_keypair(const ec_keypair_t *kp, const char *path)
         return 4;
     }
 
-    DWORD written;
+    DWORD written = 0;
     BOOL ok = WriteFile(hFile, blob, blob_len, &written, NULL);
     CloseHandle(hFile);
     HeapFree(GetProcessHeap(), 0, blob);

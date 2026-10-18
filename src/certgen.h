@@ -41,9 +41,13 @@ static int sha256_file(const char *path, BYTE *out)
 
     BCRYPT_ALG_HANDLE hAlg = NULL;
     BCRYPT_HASH_HANDLE hHash = NULL;
-    if (BCryptOpenAlgorithmProvider(&hAlg, L"SHA256", NULL, 0)) return 2;
+    if (BCryptOpenAlgorithmProvider(&hAlg, L"SHA256", NULL, 0)) {
+        CloseHandle(hFile);
+        return 2;
+    }
     if (BCryptCreateHash(hAlg, &hHash, NULL, 0, NULL, 0, 0)) {
         BCryptCloseAlgorithmProvider(hAlg, 0);
+        CloseHandle(hFile);
         return 3;
     }
 
@@ -151,11 +155,12 @@ static int cert_write(const char *sbie_dir, const ec_keypair_t *kp)
         return 3;
     }
 
-    DWORD written;
+    DWORD written = 0;
     BOOL ok = WriteFile(hFile, content, (DWORD)strlen(content), &written, NULL);
+    DWORD werr = GetLastError();   /* capture before CloseHandle clobbers it */
     CloseHandle(hFile);
     if (!ok || written != (DWORD)strlen(content)) {
-        LOGE("cert_write: WriteFile failed: %lu written=%lu", GetLastError(), written);
+        LOGE("cert_write: WriteFile failed: %lu written=%lu", werr, written);
         return 4;
     }
     return 0;
@@ -179,11 +184,12 @@ static int cert_resign_one(const char *exe_path, const char *sig_path,
         return 3;
     }
 
-    DWORD written;
+    DWORD written = 0;
     BOOL ok = WriteFile(hSig, sig, 64, &written, NULL);
+    DWORD werr = GetLastError();   /* capture before CloseHandle clobbers it */
     CloseHandle(hSig);
     if (!ok || written != 64) {
-        LOGE("resign: write %s failed: %lu", sig_path, GetLastError());
+        LOGE("resign: write %s failed: %lu", sig_path, werr);
         return 4;
     }
     return 0;
@@ -267,8 +273,8 @@ static void cert_backup_sigs_ex(const char *sbie_dir, const char *backup_dir,
                 refreshed++;
             }
         } else if (!have_backup) {
-            if (!CopyFileA(src, dst, FALSE))
-                LOGW("sig backup: copy failed: %s -> %s err=%lu", src, dst, GetLastError());
+            /* Copying it would only preserve our own signature, which can
+             * never verify against the vendor key - warn instead. */
             LOGW("sig backup: %s is not vendor-signed and had no backup - removing the "
                  "hook cannot restore it, repair Sandboxie to refresh", fd.cFileName);
             warned++;

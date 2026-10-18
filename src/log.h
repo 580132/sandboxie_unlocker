@@ -16,6 +16,27 @@ static char g_log_path[MAX_PATH] = {0};
  * GetModuleHandleA("version.dll"), that name is ambiguous. */
 static HMODULE g_self_module = NULL;
 
+/* The log is append-only and grows forever otherwise: every SandMan start
+ * adds ~4 KB.  One previous file is kept, the older one is overwritten. */
+#define LOG_MAX_BYTES (1024u * 1024u)
+
+static void log_rotate(void)
+{
+    HANDLE hFile = CreateFileA(g_log_path, GENERIC_READ,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               NULL, OPEN_EXISTING, 0, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+    DWORD size = GetFileSize(hFile, NULL);
+    CloseHandle(hFile);
+    if (size == INVALID_FILE_SIZE || size < LOG_MAX_BYTES) return;
+
+    char old_path[MAX_PATH];
+    strcpy_s(old_path, MAX_PATH, g_log_path);
+    char *dot = strrchr(old_path, '.');
+    if (dot) strcpy_s(dot, MAX_PATH - (dot - old_path), ".old.log");
+    MoveFileExA(g_log_path, old_path, MOVEFILE_REPLACE_EXISTING);
+}
+
 static void log_init(void)
 {
     if (g_log_path[0]) return;
@@ -26,6 +47,7 @@ static void log_init(void)
     } else {
         strcpy_s(g_log_path, MAX_PATH, "version_hook.log");
     }
+    log_rotate();
 }
 
 static void log_write(const char *level, const char *fmt, ...)
@@ -54,7 +76,7 @@ static void log_write(const char *level, const char *fmt, ...)
     int len = _snprintf_s(line, sizeof(line), _TRUNCATE, "%s%s%s\r\n", ts, prefix, msg);
     if (len < 0) len = 0;
 
-    DWORD written;
+    DWORD written = 0;
     if (len > 0) WriteFile(hFile, line, (DWORD)len, &written, NULL);
     /* Crash-time diagnostics matter: a bugcheck does not flush the cache,
      * so the lines written just before it would be lost. */

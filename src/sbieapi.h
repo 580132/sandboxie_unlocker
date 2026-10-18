@@ -33,18 +33,27 @@ typedef LONG (WINAPI *fn_SbieApi_QueryDrvInfo)(ULONG info_class, void *info_data
  * a host process.  Returns NULL (with a log line) when unavailable. */
 static void *sbie_dll_proc(const char *sbie_dir, const char *name)
 {
-    char path[MAX_PATH];
-    strcpy_s(path, MAX_PATH, sbie_dir);
-    strcat_s(path, MAX_PATH, "\\SbieDll.dll");
+    /* Loaded once: LoadLibraryEx bumps the refcount on every call and the
+     * module is never freed on purpose (see above).  One attempt only, so
+     * a machine without Sandboxie does not retry and re-log per call. */
+    static HMODULE dll = NULL;
+    static BOOL tried = FALSE;
+    if (!dll && !tried) {
+        tried = TRUE;
+        char path[MAX_PATH];
+        strcpy_s(path, MAX_PATH, sbie_dir);
+        strcat_s(path, MAX_PATH, "\\SbieDll.dll");
 
-    HMODULE dll = LoadLibraryExA(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
-    if (!dll) {
-        LOGW("sbieapi: %s not loadable: %lu", path, GetLastError());
-        return NULL;
+        dll = LoadLibraryExA(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+        if (!dll)
+            LOGW("sbieapi: %s not loadable: %lu", path, GetLastError());
     }
+    if (!dll)
+        return NULL;
+
     void *fn = (void *)GetProcAddress(dll, name);
     if (!fn)
-        LOGW("sbieapi: %s has no %s export", path, name);
+        LOGW("sbieapi: SbieDll.dll has no %s export", name);
     return fn;
 }
 

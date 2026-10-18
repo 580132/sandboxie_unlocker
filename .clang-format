@@ -1,0 +1,48 @@
+# Formatting for the unlocker sources.
+# 4-space indent, Allman braces for function definitions, K&R for control
+# statements, ~100 columns.  Long string literals are never split, comments
+# are never reflowed and include order is never touched.
+Language: Cpp
+BasedOnStyle: LLVM
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterCaseLabel: false
+  AfterClass: false
+  AfterControlStatement: Never
+  AfterEnum: false
+  AfterFunction: true
+  AfterNamespace: false
+  AfterStruct: false
+  AfterUnion: false
+  AfterExternBlock: false
+  BeforeCatch: false
+  BeforeElse: false
+  IndentBraces: false
+  SplitEmptyFunction: false
+  SplitEmptyRecord: false
+  SplitEmptyNamespace: false
+
+AllowShortBlocksOnASingleLine: Always
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: true
+AllowShortFunctionsOnASingleLine: None
+AllowShortCaseLabelsOnASingleLine: false
+IndentCaseLabels: false
+
+PointerAlignment: Right
+SpaceAfterCStyleCast: false
+SpacesBeforeTrailingComments: 2
+
+ReflowComments: false
+BreakStringLiterals: false
+SortIncludes: Never
+IncludeBlocks: Preserve
+
+BreakBeforeTernaryOperators: true
+AlignEscapedNewlines: Left
+IndentPPDirectives: None
