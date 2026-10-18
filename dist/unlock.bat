@@ -264,12 +264,11 @@ del /f /q "%SBIE_DIR%\version_hook.log"  >nul 2>&1
 reg delete "HKCU\SOFTWARE\sandboxie_unlocker" /f >nul 2>&1
 echo    Reset safe-fail state
 
-:: Compatibility with hooks installed by v1.0.3 and earlier: the old DLL
-:: staged the driver in version.dll:driver, so version.dll can survive
-:: the removal while the helper driver is still mapped.  Raise the
-:: existing crash counter to the safe-mode threshold - the surviving DLL
-:: then acts as a transparent proxy and never loads the driver or
-:: re-arms the kernel patch.
+:: Compatibility with older hooks: they staged the helper driver as an
+:: alternate data stream of version.dll, so a version.dll that cannot be
+:: deleted usually still holds a mapped driver.  Raise the crash counter to
+:: the safe-mode threshold - a surviving DLL then stays a transparent proxy
+:: and never loads the driver or re-arms the kernel patch.
 if "!dll_locked!"=="1" (
     reg add "HKCU\SOFTWARE\sandboxie_unlocker" /v fail_count /t REG_DWORD /d 3 /f >nul 2>&1
     echo    Raised fail_count - surviving DLL will stay in safe mode.

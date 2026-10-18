@@ -21,3 +21,6 @@ Certificate.dat
 
 # Local agent instructions
 AGENTS.md
+
+# Local upstream clone (separate repository, not part of this one)
+dev/

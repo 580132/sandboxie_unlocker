@@ -9,11 +9,20 @@
  *   cethash    certificate body hash determinism
  *   pe         offset->RVA mapping on a real PE file + negatives
  *   pefixture  synthetic SbieDrv-like PE: original key, patched
- *              (ECS1 fallback), multi-magic first-match, no key
+ *              (ECS1 fallback), multi-magic first-match, no key,
+ *              writable vs read-only section reporting
  *   fileio     read_file_all edge cases
  *   stale      stale staging cleanup: age grace, locks, pattern
  *   cert       Certificate.dat layout
  *   sec        restrictive DACL read-back behavior vs elevation
+ *   safety     safe-fail state machine (interrupted attempts, safe mode)
+ *   host       SandMan host predicate
+ *   kdrv       staged helper driver content verification
+ *   pte        PTE alias math + nt!MmPteBase reference scan
+ *   sigbak     .sig backup policy (refresh / keep / warn)
+ *   sbieapi    SbieDll-backed calls fail cleanly without Sandboxie
+ *   kmod       kernel module lookup smoke
+ *   log        logger append + truncation
  *
  * No kernel access, no Sandboxie interaction - safe to run anywhere.
  * Run from the repo root; argv[1] is a PE file for the mapping tests
@@ -22,6 +31,9 @@
  * Build: _tests.bat
  */
 #define WIN32_LEAN_AND_MEAN
+/* C6553 is SDK-header SAL noise for RegOpenKeyExA(..., 0, ...); suppress it
+ * before the includes, same as the DLL does. */
+#pragma warning(disable: 6553)
 #include <windows.h>
 #include <bcrypt.h>
 #include <stdio.h>
@@ -37,6 +49,8 @@
 #include "../src/kmod.h"
 #include "../src/driver_bin.h"
 #include "../src/kdrv.h"
+#include "../src/pagemap.h"
+#include "../src/sbieapi.h"
 
 /* CHECK plus early return from a void test function on failure. */
 #define CHECKV(cond, name)                                       \
@@ -112,8 +126,8 @@ static BCRYPT_KEY_HANDLE vk_import(const BYTE *pub)
     BCRYPT_ALG_HANDLE alg = NULL;
     BCRYPT_KEY_HANDLE k = NULL;
     if (BCryptOpenAlgorithmProvider(&alg, L"ECDSA_P256", NULL, 0) == 0) {
-        BCryptImportKeyPair(alg, NULL, BCRYPT_ECCPUBLIC_BLOB, &k,
-                            (BYTE *)pub, BLOB_SIZE, 0);
+        (void)BCryptImportKeyPair(alg, NULL, BCRYPT_ECCPUBLIC_BLOB, &k,
+                                  (BYTE *)pub, BLOB_SIZE, 0);
         BCryptCloseAlgorithmProvider(alg, 0);
     }
     return k;
@@ -175,6 +189,7 @@ static void test_persist(void)
     TF_GROUP("persist");
     ec_keypair_t kp = { 0 };
     CHECKV(ec_gen_keypair(&kp) == 0, "ec_gen_keypair");
+    CHECKV(kp.hKey != NULL, "keypair handle");
 
     BYTE pub[BLOB_SIZE];
     CHECKV(ec_export_pub_blob(&kp, pub) == 0, "ec_export_pub_blob");
@@ -257,7 +272,7 @@ static void test_persist(void)
 static void test_cert_hash(void)
 {
     TF_GROUP("cethash");
-    BYTE h1[32], h2[32];
+    BYTE h1[32] = { 0 }, h2[32] = { 0 };
     CHECK(cert_hash_body(h1) == 0 && cert_hash_body(h2) == 0,
           "cert_hash_body twice");
     CHECK(memcmp(h1, h2, 32) == 0, "cert hash deterministic");
@@ -351,7 +366,18 @@ static void test_pe_fixture(void)
     pe_fixture_headers(buf);
     memcpy(buf + 0x280, ORIGINAL_KEY, sizeof(ORIGINAL_KEY));
     CHECKV(write_file_simple(path, buf, sizeof(buf)), "fixture A write");
-    CHECK(pe_find_key_rva(path) == 0x1080, "fixture A: ORIGINAL_KEY RVA");
+    BOOL writable = FALSE;
+    CHECK(pe_find_key_rva_ex(path, &writable) == 0x1080 &&
+          writable == FALSE, "fixture A: ORIGINAL_KEY RVA (read-only section)");
+    pe_fixture_headers(buf);
+    IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION((IMAGE_NT_HEADERS64 *)(buf + 0x40));
+    sec->Characteristics = IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_READ;
+    memcpy(buf + 0x280, ORIGINAL_KEY, sizeof(ORIGINAL_KEY));
+    CHECKV(write_file_simple(path, buf, sizeof(buf)), "fixture A-write write");
+    writable = FALSE;
+    CHECK(pe_find_key_rva_ex(path, &writable) == 0x1080 && writable == TRUE,
+          "fixture A/writable: writable section reported");
+    CHECK(pe_find_key_rva(path) == 0x1080, "fixture A: wrapper keeps the RVA");
 
     /* B: patched driver - no ORIGINAL_KEY, single ECS1 magic fallback. */
     pe_fixture_headers(buf);
@@ -412,7 +438,8 @@ static void test_fileio(void)
         DeleteFileA(empty);
     }
 
-    const BYTE payload[16] = "0123456789abcdef";
+    BYTE payload[16];
+    memcpy(payload, "0123456789abcdef", sizeof(payload));
     char small[MAX_PATH];
     temp_path(small, sizeof(small), "sbie_selftest_small.bin");
     CHECKV(write_file_simple(small, payload, sizeof(payload)), "write 16B");
@@ -553,7 +580,7 @@ static void test_cert(void)
      * body hash recomputed from the same tags. */
     BYTE hash[32];
     CHECK(cert_hash_body(hash) == 0, "recompute body hash");
-    char *line = strstr((char *)data, "SIGNATURE: ");
+    const char *line = strstr((char *)data, "SIGNATURE: ");
     CHECK(line != NULL, "SIGNATURE line parse");
     if (line) {
         BYTE fileSig[64];
@@ -712,6 +739,211 @@ static void test_kdrv_verify(void)
     DeleteFileA(path);
 }
 
+/* ---------------- PTE alias math (writes into read-only pages) ---------------- */
+
+static void test_pte(void)
+{
+    TF_GROUP("pte");
+
+    /* Machine-dependent: 4-level paging, or refused on LA57 systems. */
+    if (!kdrv_pte_supported())
+        SKIP_TEST("4-level paging", "LA57 host - PTE alias unsupported by design");
+    else
+        CHECK(kdrv_pte_supported(), "4-level paging");
+
+    /* Fixed pre-RS1 base doubles as the arithmetic fixture. */
+    const ULONG64 PTE_BASE = 0xFFFFF68000000000ULL;
+
+    CHECK(kdrv_pte_va(PTE_BASE, 0) == PTE_BASE, "page 0 PTE");
+    CHECK(kdrv_pte_va(PTE_BASE, 0x1000) == PTE_BASE + 8,
+          "consecutive pages are 8 bytes apart");
+
+    /* Real key VA from the 0xBE dump (SbieDrv base + RVA 0x330C0): only the
+     * low 36 bits of (va >> 12) are indices, the canonical sign extension
+     * above them must not leak into the address. */
+    ULONG64 kernel_va = 0xFFFFF8065E5130C0ULL;
+    ULONG64 pte = kdrv_pte_va(PTE_BASE, kernel_va);
+    CHECK(pte >= PTE_BASE && pte < PTE_BASE + 0x8000000000ULL,
+          "kernel VA PTE stays in the self-map window");
+    CHECK((pte & 7) == 0, "PTE address is 8-byte aligned");
+    CHECK(pte == kdrv_pte_va(PTE_BASE, kernel_va & 0x0000FFFFFFFFFFFFULL),
+          "sign extension of the VA is ignored");
+
+    /* Alias entry built from the read-only .rdata PTE captured in the dump. */
+    ULONG64 src = 0x8900001089a35021ULL;
+    ULONG64 alias = kdrv_alias_pte(src);
+    CHECK((src & 0x2) == 0, "dump PTE fixture is read-only");
+    CHECK((alias & 0x000FFFFFFFFFF000ULL) == (src & 0x000FFFFFFFFFF000ULL),
+          "alias keeps the physical frame");
+    CHECK((alias & 0x1) != 0 && (alias & 0x2) != 0, "alias is present and writable");
+    CHECK((alias & 0x4) == 0, "alias stays supervisor (SMAP)");
+    CHECK(alias & 0x8000000000000000ULL, "alias is non-executable");
+    CHECK((alias & ~0x000FFFFFFFFFF000ULL) == 0x8000000000000003ULL,
+          "alias carries no flags from the source PTE");
+
+    /* Self-map base shape. */
+    CHECK(kdrv_is_pte_base(0xFFFFF88000000000ULL), "real base from the dump accepted");
+    CHECK(kdrv_is_pte_base(0xFFFFF68000000000ULL), "pre-RS1 fixed base accepted");
+    CHECK(!kdrv_is_pte_base(0), "zero rejected");
+    CHECK(!kdrv_is_pte_base(0xFFFFF88000000001ULL), "low bits rejected");
+    CHECK(!kdrv_is_pte_base(0xFFFFF88000001000ULL), "page offset rejected");
+    CHECK(!kdrv_is_pte_base(0x0000F88000000000ULL), "user-half value rejected");
+
+    /* mm!MmPteBase reference idiom, bytes taken from the live 24H2 kernel
+     * (ntoskrnl .text RVA 0x504E31 points at nt!MmPteBase, RVA 0xFC44C8). */
+    static const BYTE ref[KDRV_MMPTE_PATTERN_LEN] = {
+        0x48, 0x8B, 0x05, 0x90, 0xF6, 0xAB, 0x00, 0x48, 0xC1, 0xEB, 0x09
+    };
+    CHECK(kdrv_pte_ref_target(ref, 0x504E31) == 0xFC44C8, "reference resolves to MmPteBase RVA");
+
+    BYTE bad[KDRV_MMPTE_PATTERN_LEN];
+    memcpy(bad, ref, sizeof(bad));
+    bad[2] = 0x0D;                       /* mov rcx, not rax */
+    CHECK(kdrv_pte_ref_target(bad, 0x504E31) == 0, "other register rejected");
+    memcpy(bad, ref, sizeof(bad));
+    bad[10] = 0x0C;                      /* shr by 12, not 9 */
+    CHECK(kdrv_pte_ref_target(bad, 0x504E31) == 0, "other shift rejected");
+    memcpy(bad, ref, sizeof(bad));
+    bad[0] = 0x4C;                       /* not a RIP-relative load */
+    CHECK(kdrv_pte_ref_target(bad, 0x504E31) == 0, "other opcode rejected");
+
+    /* Chunk scan keeps only references into the ntoskrnl image. */
+    kdrv_pte_ref_t refs[KDRV_MAX_PTE_REFS];
+    int ref_count = 0;
+    BYTE code[64];
+    memset(code, 0x90, sizeof(code));
+    memcpy(code + 16, ref, sizeof(ref));
+    /* Image base chosen so the target lands on the live MmPteBase RVA. */
+    const ULONG64 img = 0x400000ULL;
+    ULONG64 code_va = img + 0x504E21ULL;   /* pattern at +16 -> ref at 0x504E31 */
+    kdrv_pte_refs_in_chunk(code, code_va, sizeof(code),
+                           img, 0x2000000ULL, refs, &ref_count);
+    CHECK(ref_count == 1 && refs[0].va == img + 0xFC44C8 && refs[0].hits == 1,
+          "in-image reference collected");
+
+    /* A second reference to the same variable must merge into one vote. */
+    memcpy(code + 32, ref, sizeof(ref));
+    code[32 + 3] = 0x80;                   /* same target from the later site */
+    code[32 + 4] = 0xF6;
+    code[32 + 5] = 0xAB;
+    code[32 + 6] = 0x00;
+    ref_count = 0;
+    kdrv_pte_refs_in_chunk(code, code_va, sizeof(code),
+                           img, 0x2000000ULL, refs, &ref_count);
+    CHECK(ref_count == 1 && refs[0].hits == 2, "repeated reference aggregated");
+
+    ref_count = 0;
+    kdrv_pte_refs_in_chunk(code, code_va, sizeof(code),
+                           0xC0000000, 0x10000, refs, &ref_count);
+    CHECK(ref_count == 0, "reference outside the image dropped");
+}
+
+/* ---------------- .sig backup policy ---------------- */
+
+static void test_sigbak(void)
+{
+    TF_GROUP("sigbak");
+
+    /* "Vendor" key (stands in for the baked ORIGINAL_KEY, whose private
+     * half nobody has) and "our" re-signing key. */
+    ec_keypair_t vendor = {0}, ours = {0};
+    BYTE vendorPub[BLOB_SIZE], ourPub[BLOB_SIZE];
+    CHECKV(ec_gen_keypair(&vendor) == 0 && ec_export_pub_blob(&vendor, vendorPub) == 0,
+           "vendor keypair");
+    CHECKV(ec_gen_keypair(&ours) == 0 && ec_export_pub_blob(&ours, ourPub) == 0,
+           "our keypair");
+
+    char dir[MAX_PATH], bdir[MAX_PATH], exe[MAX_PATH], sig[MAX_PATH], bsig[MAX_PATH];
+    temp_path(dir, sizeof(dir), "sbie_selftest_sigbak");
+    temp_path(bdir, sizeof(bdir), "sbie_selftest_sigbak\\backup");
+    temp_path(exe, sizeof(exe), "sbie_selftest_sigbak\\App.exe");
+    temp_path(sig, sizeof(sig), "sbie_selftest_sigbak\\App.exe.sig");
+    temp_path(bsig, sizeof(bsig), "sbie_selftest_sigbak\\backup\\App.exe.sig");
+
+    CHECKV(CreateDirectoryA(dir, NULL) || GetLastError() == ERROR_ALREADY_EXISTS,
+           "create fixture dir");
+    CHECKV(write_file_simple(exe, (const BYTE *)"fake executable payload", 24),
+           "write fixture exe");
+
+    BYTE hash[32];
+    CHECKV(sha256_file(exe, hash) == 0, "hash fixture exe");
+
+    BYTE vendorSig[SIG_SIZE], ourSig[SIG_SIZE];
+    CHECKV(ec_sign_hash(&vendor, hash, vendorSig) == 0, "sign with vendor key");
+    CHECKV(ec_sign_hash(&ours, hash, ourSig) == 0, "sign with our key");
+
+    CHECK(ec_verify_pub(vendorPub, hash, vendorSig) == 0,
+          "verify helper accepts a valid signature");
+    BYTE bad[SIG_SIZE];
+    memcpy(bad, vendorSig, sizeof(bad));
+    bad[7] ^= 0xFF;
+    CHECK(ec_verify_pub(vendorPub, hash, bad) != 0, "verify helper rejects a corrupted signature");
+    CHECK(ec_verify_pub(ourPub, hash, vendorSig) != 0, "verify helper rejects a foreign key");
+
+    CHECK(cert_sig_is_vendor(exe, sig, vendorPub) == -1, "missing .sig is unreadable");
+
+    /* 1. Vendor-signed install, no backup yet -> backup written. */
+    CHECKV(write_file_simple(sig, vendorSig, sizeof(vendorSig)), "write vendor .sig");
+    CHECK(cert_sig_is_vendor(exe, sig, vendorPub) == 1, "vendor .sig recognized");
+    cert_backup_sigs_ex(dir, bdir, vendorPub);
+    CHECK(exists(bsig) && cert_sig_is_vendor(exe, bsig, vendorPub) == 1,
+          "vendor .sig backed up");
+
+    /* 2. Stale backup + vendor-signed install -> backup refreshed. */
+    CHECKV(write_file_simple(bsig, ourSig, sizeof(ourSig)), "make the backup stale");
+    CHECK(cert_sig_is_vendor(exe, bsig, vendorPub) != 1, "stale backup is not vendor-signed");
+    cert_backup_sigs_ex(dir, bdir, vendorPub);
+    CHECK(cert_sig_is_vendor(exe, bsig, vendorPub) == 1,
+          "stale backup refreshed from the vendor-signed install");
+
+    /* 3. Installed .sig already re-signed by us -> the good backup is kept. */
+    CHECKV(write_file_simple(sig, ourSig, sizeof(ourSig)), "re-sign the installed .sig");
+    cert_backup_sigs_ex(dir, bdir, vendorPub);
+    CHECK(cert_sig_is_vendor(exe, bsig, vendorPub) == 1,
+          "valid backup kept when the installed .sig is not vendor-signed");
+
+    /* 4. No usable backup and no vendor signature: nothing may be
+     * destroyed, the operator has to repair the install. */
+    CHECKV(write_file_simple(bsig, bad, sizeof(bad)), "spoil the backup");
+    cert_backup_sigs_ex(dir, bdir, vendorPub);
+    CHECK(exists(bsig) && cert_sig_is_vendor(exe, bsig, vendorPub) != 1,
+          "unusable backup is left untouched (no data loss)");
+
+    DeleteFileA(sig); DeleteFileA(bsig); DeleteFileA(exe);
+    RemoveDirectoryA(bdir); RemoveDirectoryA(dir);
+    ec_free_keypair(&vendor);
+    ec_free_keypair(&ours);
+}
+
+/* ---------------- SbieDll-backed driver calls ---------------- */
+
+static void test_sbieapi(const char *dllPath)
+{
+    TF_GROUP("sbieapi");
+
+    /* No Sandboxie directory at all: clean failure, no crash. */
+    CHECK(sbie_reload_certificate("C:\\sbie_selftest_missing_dir_xyz") != 0,
+          "missing SbieDll -> clean failure");
+    sbie_log_cert_state("C:\\sbie_selftest_missing_dir_xyz");
+    CHECK(TRUE, "state query on a missing install does not crash");
+
+    /* A real DLL without the SbieApi_ exports must also fail cleanly. */
+    char dir[MAX_PATH], dll[MAX_PATH], dllLog[MAX_PATH];
+    temp_path(dir, sizeof(dir), "sbie_selftest_sbiedir");
+    temp_path(dll, sizeof(dll), "sbie_selftest_sbiedir\\SbieDll.dll");
+    temp_path(dllLog, sizeof(dllLog), "sbie_selftest_sbiedir\\version_hook.log");
+    CreateDirectoryA(dir, NULL);
+    CHECKV(CopyFileA(dllPath, dll, FALSE) || GetLastError() == ERROR_FILE_EXISTS,
+           "stage a stand-in SbieDll");
+    CHECK(sbie_reload_certificate(dir) != 0, "DLL without the export -> clean failure");
+    sbie_log_cert_state(dir);
+    CHECK(TRUE, "state query on a foreign DLL does not crash");
+
+    DeleteFileA(dllLog);
+    DeleteFileA(dll);
+    RemoveDirectoryA(dir);
+}
+
 /* ---------------- kernel module lookup (user-mode API smoke) ---------------- */
 
 static void test_kmod(void)
@@ -753,7 +985,7 @@ static void test_log(void)
     strcpy_s(slash ? slash + 1 : logp, MAX_PATH, "version_hook.log");
 
     DWORD before = file_size(logp);
-    LOGI("selftest marker %u", GetTickCount());
+    LOGI("selftest marker %llu", (unsigned long long)GetTickCount64());
     CHECK(file_size(logp) > before, "log line appended");
 
     /* A message far beyond the 1024-byte buffer must truncate, not
@@ -785,6 +1017,9 @@ int main(int argc, char **argv)
     test_safety();
     test_host();
     test_kdrv_verify();
+    test_pte();
+    test_sigbak();
+    test_sbieapi(pePath);
     test_kmod();
     test_log();
     return tf_summary();

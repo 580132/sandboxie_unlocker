@@ -11,6 +11,8 @@
 #include <windows.h>
 #include "log.h"
 #include "ecrypto.h"
+#include "fileio.h"
+#include "pesearch.h"
 
 /* Certificate tags that produce:
  *   type  = eCertEternal (4)
@@ -187,9 +189,42 @@ static int cert_resign_one(const char *exe_path, const char *sig_path,
     return 0;
 }
 
-/* Backup original .sig files; per-file "copy only if missing" so a
- * partial backup from an interrupted run gets completed. */
-static void cert_backup_sigs(const char *sbie_dir, const char *backup_dir)
+/* Does *sig_path* hold the vendor signature for *exe_path*, verified with
+ * *trusted_pub*?  Returns 1 (valid), 0 (not this key) or -1 (unreadable). */
+static int cert_sig_is_vendor(const char *exe_path, const char *sig_path,
+                              const BYTE *trusted_pub)
+{
+    BYTE hash[32];
+    if (sha256_file(exe_path, hash) != 0) return -1;
+
+    BYTE *sig = NULL;
+    DWORD sigSize = 0;
+    if (!read_file_all(sig_path, &sig, &sigSize, 4096) || sigSize != SIG_SIZE) {
+        if (sig) HeapFree(GetProcessHeap(), 0, sig);
+        return -1;
+    }
+
+    int ok = (ec_verify_pub(trusted_pub, hash, sig) == 0) ? 1 : 0;
+    HeapFree(GetProcessHeap(), 0, sig);
+    return ok;
+}
+
+/* Backup original .sig files.
+ *
+ * A backup is only useful when it holds the *vendor* signature of the
+ * installed executables: "copy once and never look again" kept a stale
+ * backup alive across a Sandboxie update, and restoring it afterwards
+ * left .exe and .sig mismatched.  So:
+ *   - the installed .sig verifies under *trusted_pub* (fresh install or
+ *     reinstall/repair): refresh the backup, stale or not;
+ *   - it does not: the installed pair is already our re-signed one (or
+ *     something else) - keep an existing valid backup, and say loudly
+ *     when there is none or when the one we have does not match the
+ *     installed executable (only a Sandboxie repair can fix that).
+ * The trusted key is a parameter so the policy is testable without the
+ * vendor's private key. */
+static void cert_backup_sigs_ex(const char *sbie_dir, const char *backup_dir,
+                                const BYTE *trusted_pub)
 {
     if (!CreateDirectoryA(backup_dir, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
         LOGW("sig backup: CreateDirectoryA failed: %lu - originals will be lost on re-sign", GetLastError());
@@ -204,21 +239,59 @@ static void cert_backup_sigs(const char *sbie_dir, const char *backup_dir)
     HANDLE hFind = FindFirstFileA(pattern, &fd);
     if (hFind == INVALID_HANDLE_VALUE) return;
 
+    int refreshed = 0, kept = 0, warned = 0;
+
     do {
-        char src[MAX_PATH], dst[MAX_PATH];
+        char src[MAX_PATH], dst[MAX_PATH], exe[MAX_PATH];
         strcpy_s(src, MAX_PATH, sbie_dir);
         strcat_s(src, MAX_PATH, "\\");
         strcat_s(src, MAX_PATH, fd.cFileName);
         strcpy_s(dst, MAX_PATH, backup_dir);
         strcat_s(dst, MAX_PATH, "\\");
         strcat_s(dst, MAX_PATH, fd.cFileName);
-        if (GetFileAttributesA(dst) != INVALID_FILE_ATTRIBUTES)
-            continue;  /* backup copy already present */
-        if (!CopyFileA(src, dst, FALSE))
-            LOGW("sig backup: copy failed: %s -> %s err=%lu", src, dst, GetLastError());
+
+        strcpy_s(exe, MAX_PATH, sbie_dir);
+        strcat_s(exe, MAX_PATH, "\\");
+        size_t nameLen = strlen(fd.cFileName);
+        if (nameLen > 4)
+            strncat_s(exe, MAX_PATH, fd.cFileName, nameLen - 4);
+
+        int vendor_now = cert_sig_is_vendor(exe, src, trusted_pub);
+        BOOL have_backup = (GetFileAttributesA(dst) != INVALID_FILE_ATTRIBUTES);
+
+        if (vendor_now == 1) {
+            if (!CopyFileA(src, dst, FALSE)) {
+                LOGW("sig backup: refresh failed: %s -> %s err=%lu", src, dst, GetLastError());
+                warned++;
+            } else {
+                refreshed++;
+            }
+        } else if (!have_backup) {
+            if (!CopyFileA(src, dst, FALSE))
+                LOGW("sig backup: copy failed: %s -> %s err=%lu", src, dst, GetLastError());
+            LOGW("sig backup: %s is not vendor-signed and had no backup - removing the "
+                 "hook cannot restore it, repair Sandboxie to refresh", fd.cFileName);
+            warned++;
+        } else if (cert_sig_is_vendor(exe, dst, trusted_pub) != 1) {
+            LOGW("sig backup: %s does not match %s - stale after a Sandboxie update; "
+                 "removing the hook would restore a mismatched .sig, repair Sandboxie first",
+                 fd.cFileName, fd.cFileName);
+            warned++;
+        } else {
+            kept++;   /* valid vendor backup already in place */
+        }
     } while (FindNextFileA(hFind, &fd));
 
     FindClose(hFind);
+
+    if (refreshed || kept || warned)
+        LOGI("sig backup: refreshed %d, kept %d, warnings %d", refreshed, kept, warned);
+}
+
+/* Production policy: the vendor key of this SbieDrv generation. */
+static void cert_backup_sigs(const char *sbie_dir, const char *backup_dir)
+{
+    cert_backup_sigs_ex(sbie_dir, backup_dir, ORIGINAL_KEY);
 }
 
 /* Re-sign all .exe.sig files in the Sandboxie directory. */

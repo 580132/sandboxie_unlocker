@@ -18,9 +18,11 @@
 /* Device name is hardcoded in the driver, independent of service name. */
 #define KDRV_DEVICE   L"\\\\.\\DBUtil_2_3"
 
-/* IOCTLs from reverse-engineering sub_11170 in dbutil_2_3.sys. */
-#define KDRV_IOCTL_R  0x9B0C1EC4   /* memcpy read  (sub_15294, a2=0) */
-#define KDRV_IOCTL_W  0x9B0C1EC8   /* memcpy write (sub_15294, a2=1) */
+/* IOCTLs from reverse-engineering sub_11170 in dbutil_2_3.sys.  The flag
+ * passed to sub_15294 selects the direction: 1 = copy out of the kernel
+ * (read), 0 = copy into it (write). */
+#define KDRV_IOCTL_R  0x9B0C1EC4   /* memcpy read  (sub_15294, flag=1) */
+#define KDRV_IOCTL_W  0x9B0C1EC8   /* memcpy write (sub_15294, flag=0) */
 #define KDRV_HDR      24           /* 3 x uint64: cookie, base, offset */
 
 typedef struct {

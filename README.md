@@ -15,7 +15,7 @@
 > this to circumvent licensing in any commercial or production deployment.
 > The authors take no responsibility for misuse.
 
-Full kernel-level certificate unlock for Sandboxie-Plus **1.17.x–1.18.x** (tested on 1.17.9, 1.18.0 and 1.18.2) via a single `version.dll` proxy. No test-signing, no files needed in the install directory — everything is embedded in one DLL.
+Full kernel-level certificate unlock for Sandboxie-Plus **1.17.x–1.18.x** (tested on 1.17.9, 1.18.0, 1.18.2, 1.18.7 and 1.18.8) via a single `version.dll` proxy. No test-signing, no files needed in the install directory — everything is embedded in one DLL.
 
 **Windows x64 only** (the embedded kernel driver is 64-bit and the module enumeration uses x64 struct layouts). Tested on Windows 11 24H2 (Build 26100).
 
@@ -27,9 +27,10 @@ This tool replaces the public key in the running kernel with a freshly generated
 
 1. `version.dll` placed next to `SandMan.exe` — Windows loads it before SandMan initializes, and all 17 exports are forwarded to the real `System32\version.dll` via lazy-resolved function pointers
 2. A background thread stages the embedded driver (Dell-signed `dbutil_2_3.sys`, CVE-2021-21551) to `%WINDIR%\Temp` with a restrictive DACL, loads it as a service, finds `SbieDrv.sys` in the kernel module list and the ECDSA key RVA in the driver image on disk
-3. Generates an ECDSA P-256 keypair via Windows CNG and overwrites the public key in kernel memory
+3. Generates an ECDSA P-256 keypair via Windows CNG and overwrites the public key in kernel memory (1.18.7+ keeps the key read-only — see [Kernel key layout](#kernel-key-layout))
 4. Writes a self-signed `Certificate.dat` (type: ETERNAL, all features), backs up and re-signs all `.exe.sig` files
-5. SandMan reads the certificate from the driver — full unlock
+5. Asks the driver to re-read the certificate — SbieDrv caches it from driver load time, so the swap alone would only take effect after a service restart — and logs whether the certificate is now active
+6. SandMan reads the certificate from the driver — full unlock
 
 At startup the DLL also logs an OS security-state snapshot (vulnerable-driver blocklist flags, Smart App Control, VBS/HVCI, Secure Boot, Driver Verifier, active WDAC policies) to `version_hook.log`, so blocked loads can be diagnosed from the log alone.
 
@@ -39,7 +40,7 @@ At startup the DLL also logs an OS security-state snapshot (vulnerable-driver bl
 
 **From source:** clone the repo and run `_build.bat` (requires VS 2022+ Build Tools with the C++ workload and Windows SDK 10 — auto-detected via `vswhere.exe`). Output lands in `dist/`, then run `dist\unlock.bat`. No external dependencies — links against `bcrypt.lib`, `user32.lib`, `advapi32.lib`, `ntdll.lib`; the driver is embedded as a C byte array (`driver_bin.h`).
 
-After a reboot the kernel patch is gone — run Install Hook again. The keypair saved in `keypair.dat` is reused, so the certificate and `.sig` files do not need regeneration.
+After a reboot the kernel patch is gone, but the hook stays in the installation directory and applies it again on the next SandMan start — no service reconfiguration and no second start needed. Install Hook is only required to install or refresh the hook, or to force a SandMan restart. The keypair saved in `keypair.dat` is reused, so the certificate and `.sig` files do not need regeneration.
 
 ## Driver blocklist
 
@@ -64,6 +65,13 @@ Notes:
 ## Removing the hook
 
 Remove Hook mirrors the official installer stop sequence: kills GUI processes, runs `KmdUtil scandll_silent` to terminate sandboxed processes, stops `SbieSvc` and polls for STOPPED, then unloads `SbieDrv` via `KmdUtil stop SbieDrv` (which calls `API_UNLOAD_DRIVER` — requires `Api_UseCount == 1`, i.e. SbieSvc fully stopped). It restores the original `.sig` files from `sig_backup/`, deletes generated files, resets the safe-fail state and restarts services. SandMan reloads `SbieDrv.sys` with the original key — no reboot required.
+
+A backup is only useful while it matches the installed executables, so it is
+maintained, not written once: it is refreshed whenever the installed `.sig`
+is still vendor-signed (fresh install, or after a Sandboxie repair), a valid
+backup is kept as-is, and a stale one is reported in `version_hook.log` —
+repair Sandboxie once and run Install Hook again to refresh it before
+removing the hook.
 
 ## Crash safety
 
@@ -90,7 +98,7 @@ SIGNATURE: <base64 raw R||S ECDSA P-256>
 
 ### Kernel key layout
 
-72-byte BCRYPT ECCPUBLIC_BLOB at RVA `0x39590` in `.data` section:
+72-byte BCRYPT ECCPUBLIC_BLOB at RVA `0x39590` in `.data` for 1.17.x - 1.18.2:
 
 | Offset | Field | Value |
 |--------|-------|-------|
@@ -98,6 +106,20 @@ SIGNATURE: <base64 raw R||S ECDSA P-256>
 | 4 | KeySize | `0x20` (4 bytes, LE) |
 | 8 | X | 32 bytes, big-endian |
 | 40 | Y | 32 bytes, big-endian |
+
+SbieDrv 1.18.7 declares the key `const`, moving it into the read-only
+`.rdata` section (RVA `0x330C0`).  The helper driver's memmove has no SEH, so
+writing there directly is the 0xBE bugcheck users hit on 1.18.7+.  The
+unlocker therefore checks the key's section flags in `SbieDrv.sys` on disk:
+a writable section is written directly, a read-only one through a writable
+alias of the same physical frame (the PTE of a throwaway user page is
+repointed at it, so the original read-only mapping and its TLB entries stay
+untouched).  The page-table self-map base is randomized per boot since
+Windows 10 RS1 and is read from `nt!MmPteBase`, located by a code idiom in
+the mapped ntoskrnl and validated against an owned page before any write.
+Pre-RS1 kernels use the fixed classic base (gated on the OS build), 5-level
+paging (LA57) is refused, and on Memory Integrity the alias PTE is writable
+but non-executable to stay within the hypervisor's W^X rule.
 
 ### Driver IOCTLs (dbutil_2_3.sys, METHOD_BUFFERED)
 
@@ -107,6 +129,11 @@ SIGNATURE: <base64 raw R||S ECDSA P-256>
 | `0x9B0C1EC8` | Kernel memory write (`memmove`) |
 
 Buffer: `[cookie:8][base:8][offset:8][data:N]` — cookie=0 bypasses driver cookie check.
+
+The driver also exposes (unused here) physical memory read/write via
+`MmMapIoSpace` (`0x9B0C1F44` / `0x9B0C1F40`), a contiguous-buffer alloc/free
+pair (`0x9B0C1EC0` / `0x9B0C1ECC`) and vendor status calls — an option only
+if a future SbieDrv build hides the key where a PTE alias cannot reach.
 
 No SEH in driver — invalid page causes BSOD. Key RVA validated via `ECS1` magic before write.
 
@@ -122,20 +149,24 @@ sandboxie_unlocker/
 │   ├── ecrypto.h        # ECDSA P-256 via CNG (bcrypt.dll), keypair save/load
 │   ├── fileio.h         # Read whole file + stale staging cleanup
 │   ├── kdrv.h           # Kernel R/W via IOCTLs, service management
+│   ├── pagemap.h        # Writes into read-only pages: PTE alias + nt!MmPteBase locator
 │   ├── kmod.h           # NtQuerySystemInformation: kernel module enumeration
 │   ├── pesearch.h       # PE parsing: find key RVA, store original key
 │   ├── certgen.h        # Certificate.dat generation + .sig re-signing
 │   ├── safety.h         # Safe-fail state machine (interrupted-attempt counter)
 │   ├── hostguard.h      # Host process gate (unlock only inside SandMan.exe)
 │   ├── sysguard.h       # OS security-state snapshot (blocklist, VBS/HVCI, WDAC, ...)
+│   ├── sbieapi.h        # Certificate reload + licence state via SbieDll
 │   ├── log.h            # File logger (version_hook.log)
 │   ├── version.h        # Version + author metadata
 │   └── version.rc       # PE version info resource
 ├── tests/
 │   ├── testfw.h         # Minimal test framework (groups, PASS/FAIL/SKIP, filter)
 │   ├── selftest.c       # Unit + filesystem tests (crypto, PE, cleanup, DACL, ...)
-│   └── proxytest.c      # Loads the built DLL: export forwarding, host filter
+│   ├── proxytest.c      # Loads the built DLL: export forwarding, host filter
+│   └── ptelive.c        # Admin live check: read-only page write via alias
 ├── _tests.bat         # Builds and runs the whole suite, non-zero exit on failure
+├── _ptelive.bat       # Builds and runs the admin-only PTE live check
 ├── _build.bat         # MSVC build script (outputs to dist/)
 ├── .github/workflows/ # CI + release automation
 └── README.md
@@ -145,8 +176,9 @@ sandboxie_unlocker/
 
 `_tests.bat` builds and runs the suite (MSVC, no external dependencies). It is safe on any machine: kernel and live-Sandboxie paths are never exercised. Started without arguments (e.g. double-click) the console stays open after the run; pass any argument (CI) to exit immediately.
 
-- `selftest.c` — base64 vectors, ECDSA sign/verify round-trips via CNG, keypair persistence (blob + file with admin-DACL awareness), certificate body hash, PE offset→RVA mapping on a real file plus a synthetic SbieDrv-like fixture (original key, patched fallback, multi-magic, truncated key, bogus headers), fileio edge cases, stale staging cleanup, certificate layout, restrictive DACL behavior per token elevation, safe-fail state machine, host-filter predicate, staged-driver byte verification, kernel module lookup smoke.
+- `selftest.c` — base64 vectors, ECDSA sign/verify round-trips via CNG, keypair persistence (blob + file with admin-DACL awareness), certificate body hash, PE offset→RVA mapping on a real file plus a synthetic SbieDrv-like fixture (original key, patched fallback, multi-magic, truncated key, bogus headers, writable/read-only section reporting), fileio edge cases, stale staging cleanup, certificate layout, restrictive DACL behavior per token elevation, safe-fail state machine, host-filter predicate, staged-driver byte verification, PTE alias math and the `nt!MmPteBase` reference scan, `.sig` backup policy, SbieDll-backed calls without Sandboxie, kernel module lookup smoke.
 - `proxytest.c` — loads the built `dist\version.dll` into a non-SandMan process: all 17 exports resolvable, version-resource query round-trips through the real version.dll (FileVersion == build version), failure hosts degrade gracefully, host filter logs the skip line, host safe-fail registry state untouched.
+- `ptelive.c` (`_ptelive.bat`) — admin-only live check of the read-only-page write path, not part of the suite: stages and loads the embedded helper driver, locates and validates `nt!MmPteBase`, then writes through a page alias into a page this process made read-only and confirms the page is still read-only for user code.
 
 CI runs the suite on every push (`.github/workflows/ci.yml`).
 
@@ -157,5 +189,5 @@ CI runs the suite on every push (`.github/workflows/ci.yml`).
 | `%WINDIR%\Temp\sbie_unlock_<pid>.sys` | Staged kernel driver; restrictive DACL, locked while mapped, cleaned on later runs |
 | `Certificate.dat` | Self-signed certificate (ETERNAL, all features) |
 | `keypair.dat` | Saved ECDSA P-256 private key (reused after reboot) |
-| `sig_backup/` | Original `.exe.sig` files |
+| `sig_backup/` | Original `.exe.sig` files (refreshed while the installed pair is still vendor-signed) |
 | `version_hook.log` | Debug log with timestamps |

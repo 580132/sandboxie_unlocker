@@ -56,6 +56,9 @@ static void log_write(const char *level, const char *fmt, ...)
 
     DWORD written;
     if (len > 0) WriteFile(hFile, line, (DWORD)len, &written, NULL);
+    /* Crash-time diagnostics matter: a bugcheck does not flush the cache,
+     * so the lines written just before it would be lost. */
+    FlushFileBuffers(hFile);
     CloseHandle(hFile);
 }
 

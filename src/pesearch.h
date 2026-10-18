@@ -28,10 +28,12 @@ static const BYTE ECS1_PATTERN[8] = {
     0x45, 0x43, 0x53, 0x31, 0x20, 0x00, 0x00, 0x00,
 };
 
-/* Convert a file offset to RVA using PE section mapping.
- * Returns RVA or 0 on failure.  All header fields are bounds-checked
- * against data_size - the file must not be trusted. */
-static ULONG pe_offset_to_rva(const BYTE *pe_data, DWORD data_size, DWORD file_offset)
+/* Convert a file offset to RVA using PE section mapping.  Returns RVA or
+ * 0 on failure; *section_writable reports the section's write flag when
+ * the offset is mapped.  All header fields are bounds-checked against
+ * data_size - the file must not be trusted. */
+static ULONG pe_offset_to_rva_ex(const BYTE *pe_data, DWORD data_size, DWORD file_offset,
+                                 BOOL *section_writable)
 {
     if (data_size < sizeof(IMAGE_DOS_HEADER) + sizeof(IMAGE_NT_HEADERS64)) return 0;
     IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)pe_data;
@@ -52,16 +54,27 @@ static ULONG pe_offset_to_rva(const BYTE *pe_data, DWORD data_size, DWORD file_o
         DWORD rawEnd   = rawStart + sec[i].SizeOfRawData;
         if (rawEnd < rawStart) continue;  /* overflow guard */
         if (file_offset >= rawStart && file_offset < rawEnd) {
+            if (section_writable)
+                *section_writable = !!(sec[i].Characteristics & IMAGE_SCN_MEM_WRITE);
             return sec[i].VirtualAddress + (file_offset - rawStart);
         }
     }
     return 0;
 }
 
-/* Find the RVA of the ECDSA key in SbieDrv.sys on disk.
- * Returns RVA or 0 on failure. */
-static ULONG pe_find_key_rva(const char *driver_path)
+static ULONG pe_offset_to_rva(const BYTE *pe_data, DWORD data_size, DWORD file_offset)
 {
+    return pe_offset_to_rva_ex(pe_data, data_size, file_offset, NULL);
+}
+
+/* Find the RVA of the ECDSA key in SbieDrv.sys on disk.  *section_writable
+ * reports whether that page can be written directly (SbieDrv >= 1.18.7
+ * declares the key const, which puts it into a read-only section).
+ * Returns RVA or 0 on failure. */
+static ULONG pe_find_key_rva_ex(const char *driver_path, BOOL *section_writable)
+{
+    if (section_writable) *section_writable = TRUE;
+
     BYTE *data = NULL;
     DWORD fileSize = 0;
     if (!read_file_all(driver_path, &data, &fileSize, 16 * 1024 * 1024))
@@ -83,10 +96,15 @@ static ULONG pe_find_key_rva(const char *driver_path)
 
     ULONG rva = 0;
     if (offset)
-        rva = pe_offset_to_rva(data, fileSize, offset);
+        rva = pe_offset_to_rva_ex(data, fileSize, offset, section_writable);
 
     HeapFree(GetProcessHeap(), 0, data);
     return rva;
+}
+
+static ULONG pe_find_key_rva(const char *driver_path)
+{
+    return pe_find_key_rva_ex(driver_path, NULL);
 }
 
 #endif /* PESEARCH_H */

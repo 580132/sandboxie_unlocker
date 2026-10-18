@@ -201,11 +201,13 @@ BOOL WINAPI my_VerQueryValueW(LPCVOID a, LPCWSTR b, LPVOID *c, PUINT d) {
 #include "driver_bin.h"
 #include "ecrypto.h"
 #include "kdrv.h"
+#include "pagemap.h"
 #include "kmod.h"
 #include "pesearch.h"
 #include "certgen.h"
 #include "sysguard.h"
 #include "safety.h"
+#include "sbieapi.h"
 
 /* Unlock error codes, in step order. */
 enum {
@@ -324,9 +326,13 @@ static BOOL extract_driver(char *outPath, ULONG pathCap)
  * when the kernel is already patched, else generate), write its public
  * blob over the kernel key, and verify the write.  Returns 0 on success,
  * an ERR_* code on failure.  On failure *kp is left in a state safe for
- * one ec_free_keypair call by the caller (the caller owns the free). */
+ * one ec_free_keypair call by the caller (the caller owns the free).
+ * key_writable says whether the key's section is writable in the file on
+ * disk (SbieDrv >= 1.18.7 keeps it read-only in .rdata - those pages are
+ * written through a page alias). */
 static int patch_kernel_key(kdrv_t *drv, ULONG64 keyVa, BOOL alreadyPatched,
-                            const char *keypairPath, ec_keypair_t *kp)
+                            const char *keypairPath, BOOL key_writable,
+                            ec_keypair_t *kp)
 {
     if (alreadyPatched && ec_load_keypair(kp, keypairPath) == 0) {
         LOGI("Reusing saved keypair from keypair.dat");
@@ -352,8 +358,14 @@ static int patch_kernel_key(kdrv_t *drv, ULONG64 keyVa, BOOL alreadyPatched,
     }
     LOGI("New public key blob generated (%d bytes)", BLOB_SIZE);
 
-    if (kdrv_write(drv, keyVa, newBlob, BLOB_SIZE) != 0) {
-        LOGE("kdrv_write failed at key VA");
+    /* Direct write when the key's section is writable in the file on disk
+     * (SbieDrv <= 1.18.6), an alias write for the read-only .rdata of
+     * 1.18.7+ - see pagemap.h. */
+    int wr = key_writable ? kdrv_write(drv, keyVa, newBlob, BLOB_SIZE)
+                          : kdrv_page_write(drv, keyVa, newBlob, BLOB_SIZE);
+    if (wr != 0) {
+        LOGE("key write failed at key VA 0x%llX (%s section)", keyVa,
+             key_writable ? "writable" : "read-only");
         return ERR_WRITE_KEY;
     }
     LOGI("Public key written to kernel memory");
@@ -449,8 +461,10 @@ static DWORD WINAPI unlock_thread(LPVOID param)
     LOGI("SbieDrv.sys kernel base: 0x%llX size: 0x%X", sbieBase, imgSize);
 
     /* 3. Find key RVA from PE on disk */
-    ULONG keyRva = pe_find_key_rva(sbieDrvPath);
+    BOOL keyWritable = TRUE;
+    ULONG keyRva = pe_find_key_rva_ex(sbieDrvPath, &keyWritable);
     if (!keyRva) { LOGE("ECDSA key not found in SbieDrv.sys on disk"); err = ERR_KEY_RVA; goto cleanup; }
+    LOGI("Key section: %s", keyWritable ? "writable" : "read-only (.rdata)");
     /* The loaded module may be a different version than the file on
      * disk (upgrade between hook install and this run).  A read past
      * the image would hit unmapped memory and BSOD in the un-SEH'd
@@ -488,7 +502,7 @@ static DWORD WINAPI unlock_thread(LPVOID param)
     /* 6-8. Keypair + kernel patch + verify */
     strcpy_s(keypairPath, MAX_PATH, sbieDir);
     strcat_s(keypairPath, MAX_PATH, "\\keypair.dat");
-    err = patch_kernel_key(&drv, keyVa, alreadyPatched, keypairPath, &kp);
+    err = patch_kernel_key(&drv, keyVa, alreadyPatched, keypairPath, keyWritable, &kp);
     if (err) { ec_free_keypair(&kp); goto cleanup; }
     kp_valid = TRUE;
 
@@ -496,7 +510,7 @@ static DWORD WINAPI unlock_thread(LPVOID param)
     kdrv_unload(&drv);
     LOGI("Kernel driver unloaded");
 
-    /* 10. Backup & re-sign .sig files */
+    /* 10. Back up the .sig files before they are overwritten (step 12). */
     strcpy_s(backupDir, MAX_PATH, sbieDir);
     strcat_s(backupDir, MAX_PATH, "\\sig_backup");
     cert_backup_sigs(sbieDir, backupDir);
@@ -517,6 +531,20 @@ static DWORD WINAPI unlock_thread(LPVOID param)
         LOGI("Re-signed %d .sig files", resigned);
     else
         LOGW("No .sig files re-signed - unexpected installation layout");
+
+    /* 13. SbieDrv caches its certificate state from driver load time, so
+     * the swapped key alone does not unlock anything: the driver has to
+     * re-read Certificate.dat (the same call Sandboxie's About dialog
+     * makes).  Without this the license only appears after a service
+     * restart or a second SandMan start - the state is logged before and
+     * after, so the log shows what the reload changed. */
+    sbie_log_cert_state(sbieDir);
+    if (sbie_reload_certificate(sbieDir) == 0)
+        LOGI("Driver asked to re-read the certificate");
+    else
+        LOGW("Certificate not refreshed automatically - if Sandboxie still reports "
+             "no license, restart the SbieSvc service once");
+    sbie_log_cert_state(sbieDir);
 
     LOGI("Unlock complete!");
     safety_finish_success();

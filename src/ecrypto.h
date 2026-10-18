@@ -57,6 +57,27 @@ static int ec_sign_hash(const ec_keypair_t *kp, const BYTE *hash32, BYTE *out)
     return 0;
 }
 
+/* Verify a raw R||S ECDSA P-256 signature (64 bytes) over a 32-byte
+ * SHA-256 hash against an exported 72-byte BCRYPT ECCPUBLIC_BLOB.
+ * Returns 0 when the signature is valid. */
+static int ec_verify_pub(const BYTE *pubBlob, const BYTE *hash32, const BYTE *sig64)
+{
+    BCRYPT_ALG_HANDLE hAlg = NULL;
+    BCRYPT_KEY_HANDLE hKey = NULL;
+
+    NTSTATUS st = BCryptOpenAlgorithmProvider(&hAlg, L"ECDSA_P256", NULL, 0);
+    if (st) return 1;
+    st = BCryptImportKeyPair(hAlg, NULL, BCRYPT_ECCPUBLIC_BLOB, &hKey,
+                             (PUCHAR)pubBlob, BLOB_SIZE, 0);
+    if (st) { BCryptCloseAlgorithmProvider(hAlg, 0); return 2; }
+
+    st = BCryptVerifySignature(hKey, NULL, (PUCHAR)hash32, 32,
+                               (PUCHAR)sig64, SIG_SIZE, 0);
+    BCryptDestroyKey(hKey);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    return st ? 3 : 0;
+}
+
 /* Base64 encode (standard, no line breaks). */
 static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 

@@ -19,6 +19,8 @@
  * Exits non-zero on any failure.
  */
 #define WIN32_LEAN_AND_MEAN
+/* C6553 is SDK-header SAL noise for RegOpenKeyExA(..., 0, ...). */
+#pragma warning(disable: 6553)
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
